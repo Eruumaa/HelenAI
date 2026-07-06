@@ -27,6 +27,7 @@ interface QueueItem {
     thumbnail?: string;
     duration?: string;
     channel?: string;
+    isAutoplay?: boolean;
 }
 
 interface ServerQueue {
@@ -159,7 +160,8 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 requestedBy: interaction.user.username,
                 thumbnail: searchResults[0].thumbnails[0]?.url,
                 duration: searchResults[0].durationRaw,
-                channel: searchResults[0].channel?.name
+                channel: searchResults[0].channel?.name,
+                isAutoplay: false
             });
         }
 
@@ -242,7 +244,19 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 return interaction.editReply("There was an error connecting to the voice channel!");
             }
         } else {
+            // Remove any upcoming autoplay songs from the queue (keep the currently playing song at index 0 even if it's autoplay)
+            if (serverQueue.autoplay && serverQueue.songs.length > 1) {
+                const currentSong = serverQueue.songs[0];
+                serverQueue.songs = [currentSong, ...serverQueue.songs.slice(1).filter(s => !s.isAutoplay)];
+            }
+
             serverQueue.songs.push(...songsToAdd);
+            
+            // Re-trigger autoplay fetch based on the newly added songs
+            if (serverQueue.autoplay) {
+                checkAndFetchAutoplay(serverQueue);
+            }
+
             if (songsToAdd.length > 1) {
                 return interaction.editReply(`✅ **${songsToAdd.length} songs** from the playlist have been added to the queue!`);
             } else {
@@ -262,8 +276,9 @@ async function playNextSong(guildId: string) {
     if (serverQueue.songs.length === 0) {
         if (serverQueue.autoplay && serverQueue.lastPlayedUrl) {
             try {
-                const nextSong = await getAutoplaySong(serverQueue.lastPlayedUrl);
-                serverQueue.songs.push(nextSong);
+                // If queue is completely empty but autoplay is on, fetch next batch
+                const nextSongs = await getAutoplaySongs(serverQueue.lastPlayedUrl, 10);
+                serverQueue.songs.push(...nextSongs);
             } catch (err) {
                 console.error("Autoplay failed:", err);
                 serverQueue.connection.destroy();
@@ -339,52 +354,78 @@ async function playNextSong(guildId: string) {
     }
 }
 
-async function getAutoplaySong(lastUrl: string): Promise<QueueItem> {
+async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<QueueItem[]> {
     const data = await play.video_info(lastUrl);
-    let nextUrl = "";
+    let nextUrls: string[] = [];
     
     if (data.related_videos && data.related_videos.length > 0) {
-        // Find the first valid related video
-        const relatedId = data.related_videos[0];
-        nextUrl = typeof relatedId === 'string' ? `https://www.youtube.com/watch?v=${relatedId}` : `https://www.youtube.com/watch?v=${(relatedId as any).id}`;
+        for (let i = 0; i < Math.min(count, data.related_videos.length); i++) {
+            const relatedId = data.related_videos[i];
+            const url = typeof relatedId === 'string' ? `https://www.youtube.com/watch?v=${relatedId}` : `https://www.youtube.com/watch?v=${(relatedId as any).id}`;
+            nextUrls.push(url);
+        }
     } else {
         // Fallback: search for something from the same channel or a generic mix
         const fallbackSearchTerm = data.video_details.channel?.name ? `${data.video_details.channel.name} song` : "lofi hip hop radio";
-        const fallbackSearch = await play.search(fallbackSearchTerm, { limit: 1 });
+        const fallbackSearch = await play.search(fallbackSearchTerm, { limit: count });
         if (fallbackSearch && fallbackSearch.length > 0) {
-            nextUrl = fallbackSearch[0].url;
+            nextUrls = fallbackSearch.map(s => s.url);
         } else {
             throw new Error("No related videos and fallback search failed");
         }
     }
 
-    const nextData = await play.video_info(nextUrl);
-    return {
-        title: nextData.video_details.title || "AutoPlayed Song",
-        url: nextData.video_details.url,
-        requestedBy: "AutoPlay 🤖",
-        thumbnail: nextData.video_details.thumbnails[0]?.url,
-        duration: nextData.video_details.durationRaw,
-        channel: nextData.video_details.channel?.name
-    };
+    const nextSongs: QueueItem[] = [];
+    
+    // Process sequentially to not hit rate limits too hard, or we can use Promise.all
+    // Actually, getting video_info for 10 videos might be slow. 
+    // Wait, play-dl video_info can be slow for 10 videos.
+    // However, if we just use ytDlp or just use the basic info we have...
+    // Actually, play.search or related_videos doesn't give full info without fetching them, wait related_videos usually has title and channel!
+    // Let's use the basic info if available, otherwise fetch.
+    for (let i = 0; i < nextUrls.length; i++) {
+        try {
+            const nextData = await play.video_info(nextUrls[i]);
+            nextSongs.push({
+                title: nextData.video_details.title || "AutoPlayed Song",
+                url: nextData.video_details.url,
+                requestedBy: "AutoPlay 🤖",
+                thumbnail: nextData.video_details.thumbnails[0]?.url,
+                duration: nextData.video_details.durationRaw,
+                channel: nextData.video_details.channel?.name,
+                isAutoplay: true
+            });
+        } catch (e) {
+            console.error("Failed to fetch info for autoplay song:", nextUrls[i]);
+        }
+    }
+    
+    return nextSongs;
 }
 
 async function checkAndFetchAutoplay(serverQueue: ServerQueue) {
     if (!serverQueue.autoplay) return;
-    if (serverQueue.songs.length > 1) return; // already have upcoming songs
-    if (serverQueue.songs.length === 0) return; // nothing is playing
-
-    const currentSong = serverQueue.songs[0];
+    
+    // Check how many autoplay songs are upcoming
+    const upcomingAutoplayCount = serverQueue.songs.filter(s => s.isAutoplay).length;
+    
+    // Only fetch if we have less than 2 autoplay songs upcoming
+    if (upcomingAutoplayCount >= 2) return;
+    
+    const lastSong = serverQueue.songs.length > 0 ? serverQueue.songs[serverQueue.songs.length - 1] : null;
+    const searchUrl = lastSong ? lastSong.url : serverQueue.lastPlayedUrl;
+    if (!searchUrl) return;
     
     // Prevent fetching multiple times if it's already fetching
     if (serverQueue.isFetchingAutoplay) return;
     serverQueue.isFetchingAutoplay = true;
 
     try {
-        const nextSong = await getAutoplaySong(currentSong.url);
-        // Recheck just in case the state changed while fetching (e.g. user added a song or skipped)
-        if (serverQueue.autoplay && serverQueue.songs.length === 1) {
-            serverQueue.songs.push(nextSong);
+        const nextSongs = await getAutoplaySongs(searchUrl, 10);
+        
+        // Recheck just in case the state changed while fetching (e.g. user turned off autoplay)
+        if (serverQueue.autoplay) {
+            serverQueue.songs.push(...nextSongs);
         }
     } catch (err) {
         console.error("Autoplay pre-fetch failed:", err);
