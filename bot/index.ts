@@ -68,6 +68,32 @@ export async function startBot() {
     }
   });
 
+  client.on(Events.MessageCreate, async (message) => {
+    if (message.author.bot) return;
+
+    // 1. Run AutoMod
+    const isFlagged = await checkAutoMod(message);
+    if (isFlagged) return;
+
+    // 2. Chat AI via Tag (@bot)
+    if (client.user && message.mentions.has(client.user)) {
+      const cleanMessage = message.content.replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '').trim();
+      if (!cleanMessage) {
+        await message.reply("Hi! How can I help you today?");
+        return;
+      }
+
+      try {
+        await message.channel.sendTyping();
+        const username = message.member?.nickname || message.author.displayName || message.author.username;
+        const responseText = await getChatResponse(message.channelId, username, cleanMessage);
+        await message.reply(responseText);
+      } catch (error) {
+        console.error("Tag response error:", error);
+      }
+    }
+  });
+
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const command = interaction.commandName;
