@@ -171,7 +171,55 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
         let songsToAdd: QueueItem[] = [];
 
         if (query.startsWith("http")) {
-            if (query.includes('playlist?list=')) {
+            if (query.includes('spotify.com')) {
+                try {
+                    await interaction.editReply("🎵 Loading from Spotify... This might take a moment as I search for the tracks.");
+                    const sp_data = await play.spotify(query);
+                    
+                    let tracksToSearch: string[] = [];
+                    if (sp_data.type === 'track') {
+                        const track = sp_data as any;
+                        tracksToSearch.push(`${track.name} ${track.artists[0].name}`);
+                    } else if (sp_data.type === 'playlist' || sp_data.type === 'album') {
+                        const list = sp_data as any;
+                        const tracks = await list.all_tracks();
+                        for (const track of tracks) {
+                            tracksToSearch.push(`${track.name} ${track.artists[0].name}`);
+                        }
+                    }
+
+                    if (tracksToSearch.length === 0) {
+                        return interaction.editReply("I couldn't find any tracks in that Spotify link.");
+                    }
+
+                    if (tracksToSearch.length > 30) {
+                        await interaction.followUp(`⚠️ This playlist is quite large. I will only add the first 30 songs to keep things fast!`);
+                        tracksToSearch = tracksToSearch.slice(0, 30);
+                    }
+
+                    for (const searchStr of tracksToSearch) {
+                        try {
+                            const searchResults = await play.search(searchStr, { limit: 1 });
+                            if (searchResults && searchResults.length > 0) {
+                                songsToAdd.push({
+                                    title: searchResults[0].title || "Unknown Title",
+                                    url: searchResults[0].url,
+                                    requestedBy: interaction.user.username,
+                                    thumbnail: searchResults[0].thumbnails[0]?.url,
+                                    duration: searchResults[0].durationRaw,
+                                    channel: searchResults[0].channel?.name,
+                                    isAutoplay: false
+                                });
+                            }
+                        } catch(e) {
+                            console.error("Failed to search track from spotify:", searchStr);
+                        }
+                    }
+                } catch (err) {
+                    console.error("Spotify error:", err);
+                    return interaction.editReply("Sorry, I had trouble reading that Spotify link. Make sure it's valid or try another one!");
+                }
+            } else if (query.includes('playlist?list=')) {
                 try {
                     await interaction.editReply("⏳ Loading playlist... This might take a moment.");
                     const data: any = await (ytDlp as any)(query, {
