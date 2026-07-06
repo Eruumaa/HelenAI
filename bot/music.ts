@@ -21,6 +21,25 @@ import {
     ChatInputCommandInteraction
 } from 'discord.js';
 
+let ytdlAgent: ytdl.Agent | undefined;
+if (process.env.YOUTUBE_COOKIES) {
+    try {
+        const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
+        ytdlAgent = ytdl.createAgent(cookies);
+        console.log("YouTube Cookies successfully loaded for ytdl-core!");
+    } catch (e) {
+        console.error("Failed to parse YOUTUBE_COOKIES (make sure it's a valid JSON array):", e);
+    }
+}
+
+if (process.env.YOUTUBE_COOKIE) {
+    play.setToken({
+        youtube: {
+            cookie: process.env.YOUTUBE_COOKIE
+        }
+    });
+}
+
 interface QueueItem {
     title: string;
     url: string;
@@ -318,7 +337,8 @@ async function playNextSong(guildId: string) {
         const stream = ytdl(song.url, {
             filter: 'audioonly',
             quality: 'highestaudio',
-            highWaterMark: 1 << 25
+            highWaterMark: 1 << 25,
+            agent: ytdlAgent
         });
 
         const resource = createAudioResource(stream, { inlineVolume: true });
