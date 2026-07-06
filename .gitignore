@@ -6,3 +6,5 @@ coverage/
 *.log
 .env
 *-player-script.js
+youtube-cookies.txt
+test-cookies.txt

@@ -356,16 +356,22 @@ async function playNextSong(guildId: string) {
         // Use yt-dlp-exec for streaming as ytdl-core is currently broken by YouTube player updates
         const ytDlpArgs: any = {
             output: '-',
-            quiet: true,
             format: 'bestaudio',
-            limitRate: '100K'
+            'no-warnings': true,
+            'js-runtimes': 'node'
         };
         
         if (cookiesFilePath) {
             ytDlpArgs.cookies = cookiesFilePath;
         }
 
-        const stream = (ytDlp as any).exec(song.url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
+        const stream = (ytDlp as any).exec(song.url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+        
+        // Log stderr for debugging but don't crash
+        stream.stderr?.on('data', (chunk: Buffer) => {
+            const msg = chunk.toString().trim();
+            if (msg && !msg.startsWith('[download]')) console.log('[yt-dlp]', msg);
+        });
         
         if (!stream.stdout) {
             throw new Error("yt-dlp did not return a stream");
