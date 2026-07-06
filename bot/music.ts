@@ -122,14 +122,14 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
         return true;
     } else if (command === 'list') {
         if (!serverQueue || serverQueue.songs.length === 0) {
-            await interaction.reply("The queue is currently empty!");
+            await interaction.reply({ content: "The queue is currently empty!", ephemeral: true });
             return true;
         }
-        const queueString = serverQueue.songs.map((song, index) => {
-            return `${index === 0 ? '**[Playing]**' : `**${index}.**`} ${song.title} (requested by ${song.requestedBy})`;
-        }).join('\n');
         
-        await interaction.reply(`📜 **Current Queue:**\n${queueString}`);
+        const embed = getQueueEmbed(serverQueue, 0);
+        const row = getQueuePaginationRow(0, serverQueue.songs.length);
+        
+        await interaction.reply({ embeds: [embed], components: [row] });
         return true;
     } else if (command === 'seek') {
         if (!serverQueue || serverQueue.songs.length === 0) {
@@ -617,6 +617,47 @@ function getDashboardRows(serverQueue: ServerQueue) {
     return [row1, row2, row3];
 }
 
+function getQueueEmbed(serverQueue: ServerQueue, page: number = 0) {
+    const PAGE_SIZE = 10;
+    const maxPage = Math.max(0, Math.ceil(serverQueue.songs.length / PAGE_SIZE) - 1);
+    
+    if (page < 0) page = 0;
+    if (page > maxPage) page = maxPage;
+    
+    const start = page * PAGE_SIZE;
+    const end = start + PAGE_SIZE;
+    const currentSongs = serverQueue.songs.slice(start, end);
+    
+    const queueString = currentSongs.map((song, index) => {
+        const actualIndex = start + index;
+        return `${actualIndex === 0 ? '**[Playing]**' : `**${actualIndex}.**`} [${song.title.substring(0, 50)}](${song.url}) - \`@${song.requestedBy}\``;
+    }).join('\n');
+    
+    return new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle(`📜 Queue (Page ${page + 1}/${maxPage + 1})`)
+        .setDescription(queueString || 'No songs in queue.')
+        .setFooter({ text: `Total: ${serverQueue.songs.length} songs` });
+}
+
+function getQueuePaginationRow(page: number, totalSongs: number) {
+    const PAGE_SIZE = 10;
+    const maxPage = Math.max(0, Math.ceil(totalSongs / PAGE_SIZE) - 1);
+    
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`music_qprev_${page}`)
+            .setLabel('◀️ Prev')
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(page <= 0),
+        new ButtonBuilder()
+            .setCustomId(`music_qnext_${page}`)
+            .setLabel('Next ▶️')
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(page >= maxPage)
+    );
+}
+
 export async function handleMusicInteraction(interaction: ButtonInteraction) {
     if (!interaction.customId.startsWith('music_')) return;
 
@@ -648,11 +689,22 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             if (serverQueue.songs.length === 0) {
                 return interaction.reply({ content: "The queue is currently empty!", ephemeral: true });
             }
-            const queueString = serverQueue.songs.map((song, index) => {
-                return `${index === 0 ? '**[Playing]**' : `**${index}.**`} ${song.title} (requested by ${song.requestedBy})`;
-            }).join('\n');
+            const embed = getQueueEmbed(serverQueue, 0);
+            const row = getQueuePaginationRow(0, serverQueue.songs.length);
+            await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+        } else if (interaction.customId.startsWith('music_qprev_') || interaction.customId.startsWith('music_qnext_')) {
+            const isNext = interaction.customId.startsWith('music_qnext_');
+            const currentPage = parseInt(interaction.customId.split('_').pop() || '0');
+            const targetPage = isNext ? currentPage + 1 : currentPage - 1;
             
-            await interaction.reply({ content: `📜 **Current Queue:**\n${queueString}`, ephemeral: true });
+            if (serverQueue.songs.length === 0) {
+                return interaction.update({ content: "The queue is currently empty!", embeds: [], components: [] });
+            }
+            
+            const embed = getQueueEmbed(serverQueue, targetPage);
+            const row = getQueuePaginationRow(targetPage, serverQueue.songs.length);
+            
+            await interaction.update({ embeds: [embed], components: [row] });
         } else if (interaction.customId === 'music_loop') {
             serverQueue.loop = !serverQueue.loop;
             const rows = getDashboardRows(serverQueue);
