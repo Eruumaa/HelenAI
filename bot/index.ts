@@ -42,7 +42,7 @@ export async function startBot() {
       new SlashCommandBuilder().setName('skip').setDescription('Skips the current song'),
       new SlashCommandBuilder().setName('stop').setDescription('Stops the music and leaves the channel'),
       new SlashCommandBuilder().setName('list').setDescription('Shows the music queue'),
-      new SlashCommandBuilder().setName('seek').setDescription('Menampilkan control lagu yang sedang diputar'),
+      new SlashCommandBuilder().setName('seek').setDescription('Shows the control panel for the currently playing song'),
       new SlashCommandBuilder().setName('chat').setDescription('Chat with the AI').addStringOption(option => 
         option.setName('message').setDescription('Your message to the AI').setRequired(true)
       ),
