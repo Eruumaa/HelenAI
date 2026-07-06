@@ -8,6 +8,7 @@ import {
 } from '@discordjs/voice';
 import play from 'play-dl';
 import ytDlp from 'yt-dlp-exec';
+import ytdl from '@distube/ytdl-core';
 import { getAutoplaySong } from './autoplay';
 import { 
     Message, 
@@ -313,19 +314,14 @@ async function playNextSong(guildId: string) {
     serverQueue.lastPlayedUrl = song.url;
     
     try {
-        // Use yt-dlp-exec for streaming because play-dl and ytdl-core streaming are currently broken by YouTube updates
-        const stream = (ytDlp as any).exec(song.url, {
-            output: '-',
-            quiet: true,
-            format: 'bestaudio',
-            limitRate: '100K',
-        } as any, { stdio: ['ignore', 'pipe', 'ignore'] });
-        
-        if (!stream.stdout) {
-            throw new Error("yt-dlp did not return a stream");
-        }
+        // Use @distube/ytdl-core for more reliable streaming
+        const stream = ytdl(song.url, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25
+        });
 
-        const resource = createAudioResource(stream.stdout, { inlineVolume: true });
+        const resource = createAudioResource(stream, { inlineVolume: true });
         if (resource.volume) {
             resource.volume.setVolume(serverQueue.volume);
         }
