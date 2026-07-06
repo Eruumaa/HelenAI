@@ -9,6 +9,8 @@ import {
 import play from 'play-dl';
 import ytDlp from 'yt-dlp-exec';
 import ytdl from '@distube/ytdl-core';
+import fs from 'fs';
+import path from 'path';
 import { getAutoplaySong } from './autoplay';
 import { 
     Message, 
@@ -22,11 +24,29 @@ import {
 } from 'discord.js';
 
 let ytdlAgent: ytdl.Agent | undefined;
+let cookiesFilePath: string | undefined;
+
 if (process.env.YOUTUBE_COOKIES) {
     try {
         const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
         ytdlAgent = ytdl.createAgent(cookies);
         console.log("YouTube Cookies successfully loaded for ytdl-core!");
+        
+        // Convert to Netscape format for yt-dlp
+        let netscape = "# Netscape HTTP Cookie File\n";
+        for (const cookie of cookies) {
+            const domain = cookie.domain || '';
+            const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+            const pathUrl = cookie.path || '/';
+            const secure = cookie.secure ? 'TRUE' : 'FALSE';
+            const expiration = cookie.expirationDate ? Math.round(cookie.expirationDate) : 0;
+            netscape += `${domain}\t${includeSubdomains}\t${pathUrl}\t${secure}\t${expiration}\t${cookie.name}\t${cookie.value}\n`;
+        }
+        
+        cookiesFilePath = path.join(process.cwd(), 'youtube-cookies.txt');
+        fs.writeFileSync(cookiesFilePath, netscape);
+        console.log("YouTube cookies written to youtube-cookies.txt for yt-dlp!");
+        
     } catch (e) {
         console.error("Failed to parse YOUTUBE_COOKIES (make sure it's a valid JSON array):", e);
     }
@@ -333,15 +353,25 @@ async function playNextSong(guildId: string) {
     serverQueue.lastPlayedUrl = song.url;
     
     try {
-        // Use @distube/ytdl-core for more reliable streaming
-        const stream = ytdl(song.url, {
-            filter: 'audioonly',
-            quality: 'highestaudio',
-            highWaterMark: 1 << 25,
-            agent: ytdlAgent
-        });
+        // Use yt-dlp-exec for streaming as ytdl-core is currently broken by YouTube player updates
+        const ytDlpArgs: any = {
+            output: '-',
+            quiet: true,
+            format: 'bestaudio',
+            limitRate: '100K'
+        };
+        
+        if (cookiesFilePath) {
+            ytDlpArgs.cookies = cookiesFilePath;
+        }
 
-        const resource = createAudioResource(stream, { inlineVolume: true });
+        const stream = (ytDlp as any).exec(song.url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
+        
+        if (!stream.stdout) {
+            throw new Error("yt-dlp did not return a stream");
+        }
+
+        const resource = createAudioResource(stream.stdout, { inlineVolume: true });
         if (resource.volume) {
             resource.volume.setVolume(serverQueue.volume);
         }
