@@ -11,7 +11,7 @@ import ytDlp from 'yt-dlp-exec';
 import ytdl from '@distube/ytdl-core';
 import fs from 'fs';
 import path from 'path';
-import { getAutoplaySong } from './autoplay';
+// autoplay logic is handled inline in getAutoplaySongs below
 import { 
     Message, 
     GuildMember, 
@@ -410,7 +410,7 @@ async function playNextSong(guildId: string) {
             playNextSong(guildId);
         });
 
-        serverQueue.player.on('error', (error: any) => {
+        serverQueue.player.once('error', (error: any) => {
             console.error('Audio Player Error:', error);
             serverQueue.songs.shift();
             playNextSong(guildId);
@@ -423,65 +423,85 @@ async function playNextSong(guildId: string) {
 }
 
 async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<QueueItem[]> {
-    const data = await play.video_info(lastUrl);
-    let nextUrls: string[] = [];
-    
-    if (data.related_videos && data.related_videos.length > 0) {
-        for (let i = 0; i < Math.min(count, data.related_videos.length); i++) {
-            const relatedId = data.related_videos[i];
-            const url = typeof relatedId === 'string' ? `https://www.youtube.com/watch?v=${relatedId}` : `https://www.youtube.com/watch?v=${(relatedId as any).id}`;
-            nextUrls.push(url);
+    console.log(`[Autoplay] Fetching ${count} related songs for: ${lastUrl}`);
+    const nextSongs: QueueItem[] = [];
+
+    try {
+        // Use yt-dlp to get video info + related videos in one shot
+        const ytDlpInfoArgs: any = {
+            dumpSingleJson: true,
+            flatPlaylist: true,
+            'no-warnings': true,
+            'js-runtimes': 'node'
+        };
+        if (cookiesFilePath) ytDlpInfoArgs.cookies = cookiesFilePath;
+
+        // Get the YouTube Mix (auto-generated playlist) for this video
+        // YouTube creates a "Radio" mix playlist for every video
+        const videoId = lastUrl.match(/[?&]v=([^&]+)/)?.[1];
+        if (!videoId) throw new Error('Could not extract video ID from URL');
+
+        const mixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+        
+        const data: any = await (ytDlp as any)(mixUrl, ytDlpInfoArgs);
+
+        if (data && data.entries && data.entries.length > 0) {
+            // Skip the first entry (it's the current song itself)
+            const entries = data.entries.filter((e: any) => e.id !== videoId).slice(0, count);
+            for (const entry of entries) {
+                nextSongs.push({
+                    title: entry.title || 'AutoPlayed Song',
+                    url: entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
+                    requestedBy: 'AutoPlay 🤖',
+                    thumbnail: entry.thumbnails?.[entry.thumbnails.length - 1]?.url,
+                    duration: entry.duration ? `${Math.floor(entry.duration / 60)}:${String(Math.floor(entry.duration % 60)).padStart(2, '0')}` : undefined,
+                    channel: entry.uploader || entry.channel,
+                    isAutoplay: true
+                });
+            }
         }
-    } else {
-        // Fallback: search for something from the same channel or a generic mix
-        const fallbackSearchTerm = data.video_details.channel?.name ? `${data.video_details.channel.name} song` : "lofi hip hop radio";
-        const fallbackSearch = await play.search(fallbackSearchTerm, { limit: count });
-        if (fallbackSearch && fallbackSearch.length > 0) {
-            nextUrls = fallbackSearch.map(s => s.url);
-        } else {
-            throw new Error("No related videos and fallback search failed");
+    } catch (err) {
+        console.error('[Autoplay] yt-dlp mix fetch failed, trying search fallback:', err);
+    }
+
+    // Fallback: if yt-dlp mix didn't work, use play-dl search
+    if (nextSongs.length === 0) {
+        try {
+            const searchResults = await play.search('music mix', { limit: count });
+            for (const result of searchResults) {
+                nextSongs.push({
+                    title: result.title || 'AutoPlayed Song',
+                    url: result.url,
+                    requestedBy: 'AutoPlay 🤖',
+                    thumbnail: result.thumbnails?.[0]?.url,
+                    duration: result.durationRaw,
+                    channel: result.channel?.name,
+                    isAutoplay: true
+                });
+            }
+        } catch (searchErr) {
+            console.error('[Autoplay] Fallback search also failed:', searchErr);
         }
     }
 
-    const nextSongs: QueueItem[] = [];
-    
-    // Process sequentially to not hit rate limits too hard, or we can use Promise.all
-    // Actually, getting video_info for 10 videos might be slow. 
-    // Wait, play-dl video_info can be slow for 10 videos.
-    // However, if we just use ytDlp or just use the basic info we have...
-    // Actually, play.search or related_videos doesn't give full info without fetching them, wait related_videos usually has title and channel!
-    // Let's use the basic info if available, otherwise fetch.
-    for (let i = 0; i < nextUrls.length; i++) {
-        try {
-            const nextData = await play.video_info(nextUrls[i]);
-            nextSongs.push({
-                title: nextData.video_details.title || "AutoPlayed Song",
-                url: nextData.video_details.url,
-                requestedBy: "AutoPlay 🤖",
-                thumbnail: nextData.video_details.thumbnails[0]?.url,
-                duration: nextData.video_details.durationRaw,
-                channel: nextData.video_details.channel?.name,
-                isAutoplay: true
-            });
-        } catch (e) {
-            console.error("Failed to fetch info for autoplay song:", nextUrls[i]);
-        }
-    }
-    
+    console.log(`[Autoplay] Found ${nextSongs.length} songs`);
     return nextSongs;
 }
 
 async function checkAndFetchAutoplay(serverQueue: ServerQueue) {
     if (!serverQueue.autoplay) return;
     
-    // Check how many autoplay songs are upcoming
-    const upcomingAutoplayCount = serverQueue.songs.filter(s => s.isAutoplay).length;
+    // Check how many autoplay songs are upcoming (excluding currently playing song at index 0)
+    const upcomingAutoplayCount = serverQueue.songs.slice(1).filter(s => s.isAutoplay).length;
     
     // Only fetch if we have less than 2 autoplay songs upcoming
     if (upcomingAutoplayCount >= 2) return;
     
+    // Use the last user-added song (non-autoplay) for better recommendations,
+    // falling back to the last song in queue, then the last played URL
+    const lastUserSong = [...serverQueue.songs].reverse().find(s => !s.isAutoplay);
     const lastSong = serverQueue.songs.length > 0 ? serverQueue.songs[serverQueue.songs.length - 1] : null;
-    const searchUrl = lastSong ? lastSong.url : serverQueue.lastPlayedUrl;
+    const searchUrl = lastUserSong?.url || lastSong?.url || serverQueue.lastPlayedUrl;
     if (!searchUrl) return;
     
     // Prevent fetching multiple times if it's already fetching
@@ -492,11 +512,12 @@ async function checkAndFetchAutoplay(serverQueue: ServerQueue) {
         const nextSongs = await getAutoplaySongs(searchUrl, 10);
         
         // Recheck just in case the state changed while fetching (e.g. user turned off autoplay)
-        if (serverQueue.autoplay) {
+        if (serverQueue.autoplay && nextSongs.length > 0) {
             serverQueue.songs.push(...nextSongs);
+            console.log(`[Autoplay] Added ${nextSongs.length} songs to queue. Total: ${serverQueue.songs.length}`);
         }
     } catch (err) {
-        console.error("Autoplay pre-fetch failed:", err);
+        console.error('Autoplay pre-fetch failed:', err);
     } finally {
         serverQueue.isFetchingAutoplay = false;
     }
