@@ -46,7 +46,7 @@ export async function getChatResponse(channelId: string, username: string, messa
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.5-flash",
       contents: formattedContents,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,

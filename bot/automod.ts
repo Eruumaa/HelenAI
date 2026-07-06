@@ -35,7 +35,7 @@ Message to analyze: "${text.replace(/"/g, '\\"')}"`;
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
@@ -47,7 +47,9 @@ Message to analyze: "${text.replace(/"/g, '\\"')}"`;
     if (result.isFlagged && result.confidence > 0.7) {
       console.log(`AutoMod Flagged Message: [${result.category}] ${result.reason}`);
       await message.delete();
-      await message.channel.send(`⚠️ <@${message.author.id}>, your message was removed. Reason: ${result.reason}`);
+      if ('send' in message.channel) {
+        await message.channel.send(`⚠️ <@${message.author.id}>, your message was removed. Reason: ${result.reason}`);
+      }
       return true; // was handled by automod
     }
   } catch (error) {
