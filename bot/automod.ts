@@ -18,6 +18,15 @@ export async function checkAutoMod(message: Message): Promise<boolean> {
   const text = message.content;
   if (!text) return false;
 
+  // PRE-FILTER: Jangan panggil AI jika pesannya tidak mengandung link atau kata mencurigakan
+  // Ini sangat penting untuk MENCEGAH limit 429 API Google!
+  const hasLink = /https?:\/\//i.test(text);
+  const hasSuspiciousWords = /(free|nitro|scam|click|win|gift|password|token|fuck|shit|bitch|cunt|stupid|idiot)/i.test(text);
+  
+  if (!hasLink && !hasSuspiciousWords) {
+    return false; // Pesan biasa, hemat kuota AI
+  }
+
   const prompt = `Analyze the following message sent by a Discord user. Classify it for moderation.
 Check if it contains:
 1. SPAM / SCAM / PHISHING (e.g., suspicious links, "click here to win", free discord nitro scams)
@@ -35,7 +44,7 @@ Message to analyze: "${text.replace(/"/g, '\\"')}"`;
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
