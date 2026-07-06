@@ -45,6 +45,7 @@ interface ServerQueue {
     lastPlayedUrl?: string;
     isGoingBack?: boolean;
     isFetchingAutoplay?: boolean;
+    leaveTimeout?: NodeJS.Timeout;
 }
 
 const queue = new Map<string, ServerQueue>();
@@ -203,8 +204,8 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 connection.on(VoiceConnectionStatus.Disconnected, async (oldState, newState) => {
                     try {
                         await Promise.race([
-                            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-                            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+                            entersState(connection, VoiceConnectionStatus.Signalling, 20_000),
+                            entersState(connection, VoiceConnectionStatus.Connecting, 20_000),
                         ]);
                     } catch (error) {
                         connection.destroy();
@@ -250,8 +251,17 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 serverQueue.songs = [currentSong, ...serverQueue.songs.slice(1).filter(s => !s.isAutoplay)];
             }
 
+            const wasEmpty = serverQueue.songs.length === 0;
             serverQueue.songs.push(...songsToAdd);
             
+            if (wasEmpty) {
+                if (serverQueue.leaveTimeout) {
+                    clearTimeout(serverQueue.leaveTimeout);
+                    serverQueue.leaveTimeout = undefined;
+                }
+                playNextSong(interaction.guild!.id);
+            }
+
             // Re-trigger autoplay fetch based on the newly added songs
             if (serverQueue.autoplay) {
                 checkAndFetchAutoplay(serverQueue);
@@ -286,9 +296,15 @@ async function playNextSong(guildId: string) {
                 return;
             }
         } else {
-            // Optional: wait a bit before leaving, but leaving immediately is fine for now
-            serverQueue.connection.destroy();
-            queue.delete(guildId);
+            // Wait 60 seconds before leaving
+            if (serverQueue.leaveTimeout) clearTimeout(serverQueue.leaveTimeout);
+            serverQueue.leaveTimeout = setTimeout(() => {
+                const currentQueue = queue.get(guildId);
+                if (currentQueue && currentQueue.songs.length === 0) {
+                    currentQueue.connection.destroy();
+                    queue.delete(guildId);
+                }
+            }, 60_000);
             return;
         }
     }
@@ -479,6 +495,7 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             await interaction.reply({ content: "⏭️ Skipped to the next song.", ephemeral: false });
         } else if (interaction.customId === 'music_stop') {
             serverQueue.songs = [];
+            if (serverQueue.leaveTimeout) clearTimeout(serverQueue.leaveTimeout);
             serverQueue.player.stop();
             serverQueue.connection.destroy();
             queue.delete(interaction.guildId!);
