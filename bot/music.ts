@@ -131,6 +131,29 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
         
         await interaction.reply(`📜 **Current Queue:**\n${queueString}`);
         return true;
+    } else if (command === 'seek') {
+        if (!serverQueue || serverQueue.songs.length === 0) {
+            await interaction.reply("There is no song playing right now!");
+            return true;
+        }
+        
+        const currentSong = serverQueue.songs[0];
+        
+        const embed = new EmbedBuilder()
+            .setColor('#2b2d31')
+            .setAuthor({ name: 'MUSIC PANEL' })
+            .setDescription(`💿 [${currentSong.title}](${currentSong.url})\n\n👤 **Requested By**\n\`@${currentSong.requestedBy}\`\n\n⏱️ **Music Duration**\n\`${currentSong.duration || 'Unknown'}\`\n\n🎤 **Music Author**\n\`${currentSong.channel || 'Unknown'}\``);
+        
+        if (currentSong.thumbnail) {
+            embed.setThumbnail(currentSong.thumbnail);
+        }
+        
+        const rows = getDashboardRows(serverQueue);
+        await interaction.reply({ 
+            embeds: [embed], 
+            components: rows 
+        });
+        return true;
     }
     
     return false;
