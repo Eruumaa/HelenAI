@@ -1,0 +1,6 @@
+{
+  "name": "Discord AI Bot Blueprint",
+  "description": "An immersive specification, sandbox testing playground, and deployment suite for an advanced AI Discord Bot powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
