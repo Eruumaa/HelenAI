@@ -470,8 +470,11 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
             ytDlpArgs.unshift('--cookies', cookiesFilePath);
         }
 
-        const { execa } = await import('execa');
-        const { stdout, stderr } = await execa(YT_DLP_BINARY_PATH, ytDlpArgs);
+        const { execFile } = await import('child_process');
+        const { promisify } = await import('util');
+        const execFileAsync = promisify(execFile);
+        
+        const { stdout, stderr } = await execFileAsync(YT_DLP_BINARY_PATH, ytDlpArgs);
         
         const extractedUrl = stdout.trim().split('\n').pop(); // Get the last line in case there are warnings
         
