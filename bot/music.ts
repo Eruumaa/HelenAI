@@ -414,7 +414,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
-async function getAudioStream(url: string): Promise<{ stream: string | Readable }> {
+async function getAudioStream(url: string, title?: string): Promise<{ stream: string | Readable }> {
     // Backend 1: Try yt-dlp (URL extraction)
     try {
         console.log('[Stream] Trying yt-dlp...');
@@ -465,7 +465,27 @@ async function getAudioStream(url: string): Promise<{ stream: string | Readable 
         console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
     }
 
-    throw new Error('All streaming backends failed for: ' + url);
+    // Backend 4: Try SoundCloud Fallback if YouTube completely blocks the stream
+    if (title) {
+        try {
+            console.log('[Stream] YouTube completely blocked the request. Trying SoundCloud fallback for:', title);
+            const clientId = await play.getFreeClientID();
+            play.setToken({ soundcloud: { client_id: clientId } });
+            
+            const scSearch = await play.search(title, { source: { soundcloud: 'tracks' }, limit: 1 });
+            if (scSearch && scSearch.length > 0) {
+                const playStream = await play.stream(scSearch[0].url);
+                console.log('[Stream] ✅ SoundCloud fallback stream started successfully');
+                return { stream: playStream.stream as unknown as Readable };
+            } else {
+                throw new Error("No matching track found on SoundCloud.");
+            }
+        } catch (err: any) {
+            console.log('[Stream] ❌ SoundCloud fallback failed:', err.message?.substring(0, 100));
+        }
+    }
+
+    throw new Error('All stream backends (yt-dlp, play-dl, ytdl-core, soundcloud) failed to start the audio stream.');
 }
 
 async function playNextSong(guildId: string) {
@@ -503,7 +523,7 @@ async function playNextSong(guildId: string) {
     
     try {
         // Try multiple streaming backends with automatic fallback
-        const streamResult = await getAudioStream(song.url);
+        const streamResult = await getAudioStream(song.url, song.title);
         
         const resource = createAudioResource(streamResult.stream, { 
             inlineVolume: true
