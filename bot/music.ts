@@ -421,7 +421,7 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
         const ytDlpArgs: any = {
             output: '-',
             quiet: true,
-            format: 'bestaudio/best',
+            format: 'bestaudio', // strictly audio to avoid downloading silent storyboards
             limitRate: '1M',
             rmCacheDir: true,
             'no-warnings': true,
@@ -433,37 +433,41 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
 
         const proc = (ytDlp as any).exec(url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
         
-        // Pipe stdout through a PassThrough so we don't lose any data
-        const { PassThrough } = require('stream');
-        const passthrough = new PassThrough();
-        proc.stdout?.pipe(passthrough);
-
         // Wait briefly to detect errors from stderr, without touching stdout
         await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => resolve(), 3000);
+            let isResolved = false;
+            
+            const timeout = setTimeout(() => {
+                if (!isResolved) {
+                    isResolved = true;
+                    resolve();
+                }
+            }, 2500); // Wait 2.5s to see if yt-dlp fails early
+            
             proc.on('error', (err: Error) => {
-                clearTimeout(timeout);
-                reject(err);
-            });
-            proc.stderr?.on('data', (chunk: Buffer) => {
-                const msg = chunk.toString();
-                if (msg.includes('ERROR') || msg.includes('Sign in')) {
+                if (!isResolved) {
+                    isResolved = true;
                     clearTimeout(timeout);
-                    proc.kill();
-                    reject(new Error(msg.trim()));
+                    reject(err);
                 }
             });
-            // If passthrough gets data, yt-dlp is working — but don't consume it
-            passthrough.once('data', (chunk: Buffer) => {
-                clearTimeout(timeout);
-                // IMPORTANT: push the chunk back so it's not lost
-                passthrough.unshift(chunk);
-                resolve();
+            
+            proc.stderr?.on('data', (chunk: Buffer) => {
+                const msg = chunk.toString();
+                if (msg.includes('ERROR') || msg.includes('Sign in') || msg.includes('Requested format is not available')) {
+                    if (!isResolved) {
+                        isResolved = true;
+                        clearTimeout(timeout);
+                        proc.kill();
+                        reject(new Error(msg.trim()));
+                    }
+                }
             });
         });
 
+        if (!proc.stdout) throw new Error('yt-dlp did not return a stream');
         console.log('[Stream] ✅ yt-dlp stream started successfully');
-        return { stream: passthrough };
+        return { stream: proc.stdout };
     } catch (err: any) {
         console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 100));
     }
