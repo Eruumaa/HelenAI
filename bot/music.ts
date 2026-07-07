@@ -450,22 +450,7 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
         console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
     }
 
-    // Backend 3: Try @distube/ytdl-core
-    try {
-        console.log('[Stream] Trying ytdl-core...');
-        const ytdlStream = ytdl(url, {
-            filter: 'audioonly',
-            quality: 'highestaudio',
-            highWaterMark: 1 << 25,
-            ...(ytdlAgent ? { agent: ytdlAgent } : {})
-        });
-        console.log('[Stream] ✅ ytdl-core stream started successfully');
-        return { stream: ytdlStream as unknown as Readable };
-    } catch (err: any) {
-        console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
-    }
-
-    // Backend 4: Try SoundCloud Fallback if YouTube completely blocks the stream
+    // Backend 3: Try SoundCloud Fallback if YouTube completely blocks the stream
     if (title) {
         try {
             console.log('[Stream] YouTube completely blocked the request. Trying SoundCloud fallback for:', title);
