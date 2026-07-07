@@ -83,27 +83,16 @@ if (needsDownload) {
 let cookiesFilePath: string | undefined;
 
 cookiesFilePath = undefined;
-const possiblePaths = [
-    path.join(process.cwd(), 'cookies.txt'),
-    path.resolve(__dirname, '..', 'cookies.txt'),
-    path.resolve(__dirname, 'cookies.txt'),
-];
 
-for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-        cookiesFilePath = p;
-        console.log(`[Cookies] ✅ Using local cookies file: ${p}`);
-        break;
-    }
-}
-
-if (!cookiesFilePath && process.env.YOUTUBE_COOKIES) {
+// Always prioritize the environment variable if present
+if (process.env.YOUTUBE_COOKIES) {
     try {
         const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
         ytdlAgent = ytdl.createAgent(cookies);
-        console.log("YouTube Cookies successfully loaded for ytdl-core!");
+        console.log("[Cookies] ✅ YouTube Cookies successfully loaded from ENV for ytdl-core!");
         
         let netscape = "# Netscape HTTP Cookie File\n";
+        let cookieStr = "";
         for (const cookie of cookies) {
             const domain = cookie.domain || '';
             const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
@@ -111,28 +100,44 @@ if (!cookiesFilePath && process.env.YOUTUBE_COOKIES) {
             const secure = cookie.secure ? 'TRUE' : 'FALSE';
             const expiration = cookie.expirationDate ? Math.round(cookie.expirationDate) : 0;
             netscape += `${domain}\t${includeSubdomains}\t${pathUrl}\t${secure}\t${expiration}\t${cookie.name}\t${cookie.value}\n`;
+            cookieStr += `${cookie.name}=${cookie.value}; `;
         }
         
-        cookiesFilePath = path.join(process.cwd(), 'youtube-cookies.txt');
+        cookiesFilePath = path.join(process.cwd(), 'youtube-cookies-env.txt');
         fs.writeFileSync(cookiesFilePath, netscape);
-        console.log("YouTube cookies written to youtube-cookies.txt for yt-dlp!");
+        console.log("[Cookies] ✅ YouTube cookies written to temporary file for yt-dlp!");
+
+        // Set cookies for play-dl as well
+        play.setToken({
+            youtube: {
+                cookie: cookieStr.trim()
+            }
+        });
+        console.log("[Cookies] ✅ YouTube cookies formatted and set for play-dl!");
         
     } catch (e) {
         console.error("Failed to parse YOUTUBE_COOKIES (make sure it's a valid JSON array):", e);
     }
 }
 
+// Fallback to local file if ENV is missing or failed
 if (!cookiesFilePath) {
-    console.log('[Cookies] ⚠️ No cookies found anywhere. YouTube may block requests.');
+    const possiblePaths = [
+        path.join(process.cwd(), 'cookies.txt'),
+        path.resolve(__dirname, '..', 'cookies.txt'),
+        path.resolve(__dirname, 'cookies.txt'),
+    ];
+    for (const p of possiblePaths) {
+        if (fs.existsSync(p)) {
+            cookiesFilePath = p;
+            console.log(`[Cookies] ✅ Using local cookies file fallback: ${p}`);
+            break;
+        }
+    }
 }
 
-
-if (process.env.YOUTUBE_COOKIE) {
-    play.setToken({
-        youtube: {
-            cookie: process.env.YOUTUBE_COOKIE
-        }
-    });
+if (!cookiesFilePath) {
+    console.log('[Cookies] ⚠️ No cookies found anywhere. YouTube may block requests.');
 }
 
 interface QueueItem {
