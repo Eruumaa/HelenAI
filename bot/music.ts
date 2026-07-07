@@ -28,13 +28,27 @@ import {
 let ytdlAgent: ytdl.Agent | undefined;
 let cookiesFilePath: string | undefined;
 
-if (process.env.YOUTUBE_COOKIES) {
+cookiesFilePath = undefined;
+const possiblePaths = [
+    path.join(process.cwd(), 'cookies.txt'),
+    path.resolve(__dirname, '..', 'cookies.txt'),
+    path.resolve(__dirname, 'cookies.txt'),
+];
+
+for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+        cookiesFilePath = p;
+        console.log(`[Cookies] ✅ Using local cookies file: ${p}`);
+        break;
+    }
+}
+
+if (!cookiesFilePath && process.env.YOUTUBE_COOKIES) {
     try {
         const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
         ytdlAgent = ytdl.createAgent(cookies);
         console.log("YouTube Cookies successfully loaded for ytdl-core!");
         
-        // Convert to Netscape format for yt-dlp
         let netscape = "# Netscape HTTP Cookie File\n";
         for (const cookie of cookies) {
             const domain = cookie.domain || '';
@@ -54,26 +68,10 @@ if (process.env.YOUTUBE_COOKIES) {
     }
 }
 
-// Fallback: if no env var cookies, check for a cookies.txt file in multiple locations
 if (!cookiesFilePath) {
-    const possiblePaths = [
-        path.join(process.cwd(), 'cookies.txt'),
-        path.resolve(__dirname, '..', 'cookies.txt'),
-        path.resolve(__dirname, 'cookies.txt'),
-    ];
-    console.log('[Cookies] No YOUTUBE_COOKIES env var found. Searching for cookies.txt...');
-    for (const p of possiblePaths) {
-        console.log(`[Cookies] Checking: ${p} ... exists=${fs.existsSync(p)}`);
-        if (fs.existsSync(p)) {
-            cookiesFilePath = p;
-            console.log(`[Cookies] ✅ Using cookies file: ${p}`);
-            break;
-        }
-    }
-    if (!cookiesFilePath) {
-        console.log('[Cookies] ⚠️ No cookies.txt found anywhere. YouTube may block requests.');
-    }
+    console.log('[Cookies] ⚠️ No cookies found anywhere. YouTube may block requests.');
 }
+
 
 if (process.env.YOUTUBE_COOKIE) {
     play.setToken({
