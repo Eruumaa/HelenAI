@@ -100,19 +100,33 @@ for (const p of possiblePaths) {
         try {
             const cookieFileContent = fs.readFileSync(p, 'utf8');
             let cookieStr = "";
+            const cookiesArray: any[] = [];
+            
             for (const line of cookieFileContent.split('\n')) {
                 if (line.startsWith('#') || line.trim() === '') continue;
                 const parts = line.split('\t');
                 if (parts.length >= 7) {
-                    cookieStr += `${parts[5]}=${parts[6].trim()}; `;
+                    const domain = parts[0];
+                    const pathUrl = parts[2];
+                    const secure = parts[3] === 'TRUE';
+                    const expirationDate = parseInt(parts[4]);
+                    const name = parts[5];
+                    const value = parts[6].trim();
+                    
+                    cookieStr += `${name}=${value}; `;
+                    cookiesArray.push({ name, value, domain, path: pathUrl, secure, expirationDate });
                 }
             }
             if (cookieStr) {
                 play.setToken({ youtube: { cookie: cookieStr.trim() } });
                 console.log("[Cookies] ✅ YouTube cookies parsed from file and set for play-dl!");
             }
+            if (cookiesArray.length > 0) {
+                ytdlAgent = ytdl.createAgent(cookiesArray);
+                console.log("[Cookies] ✅ ytdlAgent created from local cookies file!");
+            }
         } catch (e) {
-            console.error("Failed to parse local cookies.txt for play-dl:", e);
+            console.error("Failed to parse local cookies.txt for play-dl and ytdl-core:", e);
         }
         break;
     }
@@ -553,6 +567,20 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
         return { stream: playStream.stream as unknown as Readable };
     } catch (err: any) {
         console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
+    }
+    
+    // Backend 3: Try ytdl-core
+    try {
+        console.log('[Stream] Trying ytdl-core...');
+        const stream = ytdl(url, {
+            filter: 'audioonly',
+            highWaterMark: 1 << 25,
+            agent: ytdlAgent
+        });
+        console.log('[Stream] ✅ ytdl-core stream started successfully');
+        return { stream };
+    } catch (err: any) {
+        console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
     }
 
     throw new Error('All YouTube extractors failed to bypass bot protection.');
