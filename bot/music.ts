@@ -34,31 +34,42 @@ const YT_DLP_BINARY_PATH = path.join(process.cwd(), 'yt-dlp-binary');
 function downloadYtDlp() {
     return new Promise<void>((resolve, reject) => {
         const file = fs.createWriteStream(YT_DLP_BINARY_PATH);
-        https.get('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', (res) => {
-            if (res.statusCode === 301 || res.statusCode === 302) {
-                https.get(res.headers.location!, (res2) => {
-                    res2.pipe(file);
+        
+        const download = (url: string, redirects = 0) => {
+            if (redirects > 5) return reject(new Error('Too many redirects'));
+            https.get(url, (res) => {
+                if (res.statusCode === 301 || res.statusCode === 302) {
+                    download(res.headers.location!, redirects + 1);
+                } else if (res.statusCode === 200) {
+                    res.pipe(file);
                     file.on('finish', () => {
                         file.close();
                         fs.chmodSync(YT_DLP_BINARY_PATH, '755');
                         resolve();
                     });
-                }).on('error', reject);
-            } else {
-                res.pipe(file);
-                file.on('finish', () => {
-                    file.close();
-                    fs.chmodSync(YT_DLP_BINARY_PATH, '755');
-                    resolve();
-                });
-            }
-        }).on('error', reject);
+                } else {
+                    reject(new Error(`Failed to download yt-dlp: ${res.statusCode}`));
+                }
+            }).on('error', reject);
+        };
+        
+        download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp');
     });
 }
 
 // Download latest yt-dlp on startup if missing, or create it directly if found
-if (!fs.existsSync(YT_DLP_BINARY_PATH)) {
-    console.log("[Setup] Downloading latest yt-dlp binary because it's missing...");
+let needsDownload = true;
+if (fs.existsSync(YT_DLP_BINARY_PATH)) {
+    const stats = fs.statSync(YT_DLP_BINARY_PATH);
+    if (stats.size > 1024 * 1024) { // > 1MB
+        needsDownload = false;
+    } else {
+        fs.unlinkSync(YT_DLP_BINARY_PATH);
+    }
+}
+
+if (needsDownload) {
+    console.log("[Setup] Downloading latest yt-dlp binary...");
     downloadYtDlp().then(() => {
         ytDlp = ytDlpExec.create(YT_DLP_BINARY_PATH);
         console.log("[Setup] ✅ yt-dlp binary downloaded and ready.");
