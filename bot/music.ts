@@ -86,9 +86,7 @@ cookiesFilePath = undefined;
 
 // First priority: Local file (from user)
 const possiblePaths = [
-    path.join(process.cwd(), 'cookies.txt'),
-    path.resolve(__dirname, '..', 'cookies.txt'),
-    path.resolve(__dirname, 'cookies.txt'),
+    path.join(process.cwd(), 'cookies.txt')
 ];
 
 for (const p of possiblePaths) {
