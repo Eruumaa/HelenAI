@@ -414,16 +414,13 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
-async function getAudioStream(url: string): Promise<{ stream: Readable }> {
-    // Backend 1: Try yt-dlp
+async function getAudioStream(url: string): Promise<{ stream: string | Readable }> {
+    // Backend 1: Try yt-dlp (URL extraction)
     try {
         console.log('[Stream] Trying yt-dlp...');
         const ytDlpArgs: any = {
-            output: '-',
-            quiet: true,
+            dumpJson: true,
             format: 'bestaudio', // strictly audio to avoid downloading silent storyboards
-            limitRate: '1M',
-            rmCacheDir: true,
             'no-warnings': true,
             'extractor-args': 'youtube:player_client=default,android,ios,web'
         };
@@ -431,43 +428,14 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
             ytDlpArgs.cookies = cookiesFilePath;
         }
 
-        const proc = (ytDlp as any).exec(url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const info = await (ytDlp as any)(url, ytDlpArgs);
         
-        // Wait briefly to detect errors from stderr, without touching stdout
-        await new Promise<void>((resolve, reject) => {
-            let isResolved = false;
-            
-            const timeout = setTimeout(() => {
-                if (!isResolved) {
-                    isResolved = true;
-                    resolve();
-                }
-            }, 2500); // Wait 2.5s to see if yt-dlp fails early
-            
-            proc.on('error', (err: Error) => {
-                if (!isResolved) {
-                    isResolved = true;
-                    clearTimeout(timeout);
-                    reject(err);
-                }
-            });
-            
-            proc.stderr?.on('data', (chunk: Buffer) => {
-                const msg = chunk.toString();
-                if (msg.includes('ERROR') || msg.includes('Sign in') || msg.includes('Requested format is not available')) {
-                    if (!isResolved) {
-                        isResolved = true;
-                        clearTimeout(timeout);
-                        proc.kill();
-                        reject(new Error(msg.trim()));
-                    }
-                }
-            });
-        });
+        if (!info || !info.url) {
+            throw new Error('yt-dlp did not return a valid stream URL');
+        }
 
-        if (!proc.stdout) throw new Error('yt-dlp did not return a stream');
-        console.log('[Stream] ✅ yt-dlp stream started successfully');
-        return { stream: proc.stdout };
+        console.log('[Stream] ✅ yt-dlp stream URL extracted successfully');
+        return { stream: info.url }; // Return the raw URL directly to FFmpeg
     } catch (err: any) {
         console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 100));
     }
