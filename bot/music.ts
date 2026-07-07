@@ -484,22 +484,33 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
             url
         ];
         
-        if (cookiesFilePath) {
-            ytDlpArgs.unshift('--cookies', cookiesFilePath);
-        }
+
 
         const { execFile } = await import('child_process');
         const { promisify } = await import('util');
         const execFileAsync = promisify(execFile);
         
-        const { stdout, stderr } = await execFileAsync(YT_DLP_BINARY_PATH, ytDlpArgs);
-        
-        const extractedUrl = stdout.trim().split('\n').pop(); // Get the last line in case there are warnings
-        
-        if (!extractedUrl || !extractedUrl.startsWith('http')) {
-            console.log('[Stream] yt-dlp stdout:', stdout);
-            console.log('[Stream] yt-dlp stderr:', stderr);
-            throw new Error('yt-dlp did not return a valid stream URL');
+        const runYtDlp = async (useCookies: boolean) => {
+            const currentArgs = [...ytDlpArgs];
+            if (useCookies && cookiesFilePath) {
+                currentArgs.unshift('--cookies', cookiesFilePath);
+            }
+            const { stdout, stderr } = await execFileAsync(YT_DLP_BINARY_PATH, currentArgs);
+            const extractedUrl = stdout.trim().split('\n').pop();
+            if (!extractedUrl || !extractedUrl.startsWith('http')) {
+                throw new Error('yt-dlp did not return a valid stream URL. stderr: ' + stderr.substring(0, 200));
+            }
+            return extractedUrl;
+        };
+
+        let extractedUrl: string;
+        try {
+            console.log('[Stream] Trying yt-dlp WITH cookies...');
+            extractedUrl = await runYtDlp(true);
+        } catch (err: any) {
+            console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
+            console.log('[Stream] Trying yt-dlp WITHOUT cookies as fallback...');
+            extractedUrl = await runYtDlp(false);
         }
 
         console.log('[Stream] ✅ yt-dlp stream URL extracted successfully');
