@@ -53,7 +53,10 @@ function downloadYtDlp() {
             }).on('error', reject);
         };
         
-        download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp');
+        // Use nightly builds for better bot bypass
+        const ytDlpUrl = 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
+        console.log("[Setup] Downloading latest yt-dlp nightly binary...");
+        download(ytDlpUrl);
     });
 }
 
@@ -483,6 +486,7 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
             '-o', '-',
             '-f', 'bestaudio',
             '--no-warnings',
+            '--force-ipv4',
             '--js-runtimes', 'node',
             '--extractor-args', 'youtube:player_client=ios,android,tv',
             url
