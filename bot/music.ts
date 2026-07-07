@@ -29,7 +29,7 @@ import {
 let ytdlAgent: ytdl.Agent | undefined;
 let ytDlp: any;
 
-const YT_DLP_BINARY_PATH = path.join(process.cwd(), 'yt-dlp-binary');
+const YT_DLP_BINARY_PATH = path.join(process.cwd(), 'yt-dlp-nightly-binary');
 
 function downloadYtDlp() {
     return new Promise<void>((resolve, reject) => {
