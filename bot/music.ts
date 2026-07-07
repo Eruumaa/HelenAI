@@ -509,7 +509,9 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
                 });
                 
                 ytDlpProcess.stderr.on('data', (data) => {
-                    errorData += data.toString();
+                    const str = data.toString();
+                    errorData += str;
+                    console.log(`[yt-dlp stderr] ${str.trim()}`);
                 });
                 
                 ytDlpProcess.on('error', reject);
@@ -517,6 +519,9 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
                 ytDlpProcess.on('close', (code) => {
                     if (code !== 0) {
                         reject(new Error(`yt-dlp exited with code ${code}. Stderr: ${errorData.substring(0, 300)}`));
+                    } else if (errorData) {
+                        // Sometimes it exits 0 but fails to download or writes 0 bytes
+                        reject(new Error(`yt-dlp exited with code 0 but no data. Stderr: ${errorData.substring(0, 300)}`));
                     }
                 });
             });
