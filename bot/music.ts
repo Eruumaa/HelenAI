@@ -428,9 +428,12 @@ async function playNextSong(guildId: string) {
         // Use yt-dlp-exec for streaming as ytdl-core is currently broken by YouTube player updates
         const ytDlpArgs: any = {
             output: '-',
-            format: 'bestaudio',
+            quiet: true,
+            format: 'bestaudio/best',
+            limitRate: '1M',
+            rmCacheDir: true,
             'no-warnings': true,
-            'js-runtimes': 'node'
+            'extractor-args': 'youtube:player_client=android'
         };
         
         if (cookiesFilePath) {
