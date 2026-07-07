@@ -4,8 +4,10 @@ import {
     createAudioResource, 
     AudioPlayerStatus, 
     VoiceConnectionStatus, 
-    entersState 
+    entersState,
+    StreamType 
 } from '@discordjs/voice';
+import { Readable } from 'stream';
 import play from 'play-dl';
 import ytDlp from 'yt-dlp-exec';
 import ytdl from '@distube/ytdl-core';
@@ -52,12 +54,24 @@ if (process.env.YOUTUBE_COOKIES) {
     }
 }
 
-// Fallback: if no env var cookies, check for a cookies.txt file in the project root
+// Fallback: if no env var cookies, check for a cookies.txt file in multiple locations
 if (!cookiesFilePath) {
-    const localCookiesPath = path.join(process.cwd(), 'cookies.txt');
-    if (fs.existsSync(localCookiesPath)) {
-        cookiesFilePath = localCookiesPath;
-        console.log("Found cookies.txt file in project root, using it for yt-dlp!");
+    const possiblePaths = [
+        path.join(process.cwd(), 'cookies.txt'),
+        path.resolve(__dirname, '..', 'cookies.txt'),
+        path.resolve(__dirname, 'cookies.txt'),
+    ];
+    console.log('[Cookies] No YOUTUBE_COOKIES env var found. Searching for cookies.txt...');
+    for (const p of possiblePaths) {
+        console.log(`[Cookies] Checking: ${p} ... exists=${fs.existsSync(p)}`);
+        if (fs.existsSync(p)) {
+            cookiesFilePath = p;
+            console.log(`[Cookies] ✅ Using cookies file: ${p}`);
+            break;
+        }
+    }
+    if (!cookiesFilePath) {
+        console.log('[Cookies] ⚠️ No cookies.txt found anywhere. YouTube may block requests.');
     }
 }
 
@@ -400,6 +414,87 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
+async function getAudioStream(url: string): Promise<{ stream: Readable; type: StreamType }> {
+    // Backend 1: Try yt-dlp
+    try {
+        console.log('[Stream] Trying yt-dlp...');
+        const ytDlpArgs: any = {
+            output: '-',
+            quiet: true,
+            format: 'bestaudio/best',
+            limitRate: '1M',
+            rmCacheDir: true,
+            'no-warnings': true,
+            'extractor-args': 'youtube:player_client=default,android,ios,web'
+        };
+        if (cookiesFilePath) {
+            ytDlpArgs.cookies = cookiesFilePath;
+        }
+
+        const proc = (ytDlp as any).exec(url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+        
+        // Collect stderr to check for errors
+        let stderrData = '';
+        proc.stderr?.on('data', (chunk: Buffer) => {
+            stderrData += chunk.toString();
+        });
+
+        // Wait briefly to see if yt-dlp errors out immediately
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => resolve(), 3000);
+            proc.on('error', (err: Error) => {
+                clearTimeout(timeout);
+                reject(err);
+            });
+            proc.stderr?.once('data', (chunk: Buffer) => {
+                const msg = chunk.toString();
+                if (msg.includes('ERROR') || msg.includes('Sign in')) {
+                    clearTimeout(timeout);
+                    reject(new Error(msg.trim()));
+                }
+            });
+            // If stdout gets data, yt-dlp is working
+            proc.stdout?.once('data', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+        });
+
+        if (!proc.stdout) throw new Error('yt-dlp did not return a stream');
+        console.log('[Stream] ✅ yt-dlp stream started successfully');
+        return { stream: proc.stdout, type: StreamType.Arbitrary };
+    } catch (err: any) {
+        console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 100));
+    }
+
+    // Backend 2: Try play-dl
+    try {
+        console.log('[Stream] Trying play-dl...');
+        const playStream = await play.stream(url);
+        console.log('[Stream] ✅ play-dl stream started successfully');
+        return { stream: playStream.stream as unknown as Readable, type: playStream.type as unknown as StreamType };
+    } catch (err: any) {
+        console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
+    }
+
+    // Backend 3: Try @distube/ytdl-core
+    try {
+        console.log('[Stream] Trying ytdl-core...');
+        const ytdlStream = ytdl(url, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25,
+            ...(ytdlAgent ? { agent: ytdlAgent } : {})
+        });
+        console.log('[Stream] ✅ ytdl-core stream started successfully');
+        return { stream: ytdlStream as unknown as Readable, type: StreamType.Arbitrary };
+    } catch (err: any) {
+        console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
+    }
+
+    throw new Error('All streaming backends failed for: ' + url);
+}
+
 async function playNextSong(guildId: string) {
     const serverQueue = queue.get(guildId);
     if (!serverQueue) return;
@@ -434,34 +529,13 @@ async function playNextSong(guildId: string) {
     serverQueue.lastPlayedUrl = song.url;
     
     try {
-        // Use yt-dlp-exec for streaming as ytdl-core is currently broken by YouTube player updates
-        const ytDlpArgs: any = {
-            output: '-',
-            quiet: true,
-            format: 'bestaudio/best',
-            limitRate: '1M',
-            rmCacheDir: true,
-            'no-warnings': true,
-            'extractor-args': 'youtube:player_client=default,android,ios,web'
-        };
+        // Try multiple streaming backends with automatic fallback
+        const streamResult = await getAudioStream(song.url);
         
-        if (cookiesFilePath) {
-            ytDlpArgs.cookies = cookiesFilePath;
-        }
-
-        const stream = (ytDlp as any).exec(song.url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-        
-        // Log stderr for debugging but don't crash
-        stream.stderr?.on('data', (chunk: Buffer) => {
-            const msg = chunk.toString().trim();
-            if (msg && !msg.startsWith('[download]')) console.log('[yt-dlp]', msg);
+        const resource = createAudioResource(streamResult.stream, { 
+            inlineVolume: true,
+            inputType: streamResult.type 
         });
-        
-        if (!stream.stdout) {
-            throw new Error("yt-dlp did not return a stream");
-        }
-
-        const resource = createAudioResource(stream.stdout, { inlineVolume: true });
         if (resource.volume) {
             resource.volume.setVolume(serverQueue.volume);
         }
