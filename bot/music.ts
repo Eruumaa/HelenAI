@@ -479,7 +479,8 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
             '--get-url',
             '-f', 'bestaudio',
             '--no-warnings',
-            '--extractor-args', 'youtube:player_client=default,android,ios,web',
+            '--js-runtimes', 'node',
+            '--extractor-args', 'youtube:player_client=ios,android,tv',
             url
         ];
         
