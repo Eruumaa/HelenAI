@@ -482,50 +482,60 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
     try {
         console.log('[Stream] Trying yt-dlp...');
         const ytDlpArgs = [
-            '--get-url',
+            '-o', '-',
             '-f', 'bestaudio',
             '--no-warnings',
             '--js-runtimes', 'node',
             '--extractor-args', 'youtube:player_client=ios,android,tv',
             url
         ];
-        
 
+        const { spawn } = await import('child_process');
 
-        const { execFile } = await import('child_process');
-        const { promisify } = await import('util');
-        const execFileAsync = promisify(execFile);
-        
         const runYtDlp = async (useCookies: boolean) => {
             const currentArgs = [...ytDlpArgs];
             if (useCookies && cookiesFilePath) {
                 currentArgs.unshift('--cookies', cookiesFilePath);
             }
-            const { stdout, stderr } = await execFileAsync(YT_DLP_BINARY_PATH, currentArgs);
-            const extractedUrl = stdout.trim().split('\n').pop();
-            if (!extractedUrl || !extractedUrl.startsWith('http')) {
-                throw new Error('yt-dlp did not return a valid stream URL. stderr: ' + stderr.substring(0, 200));
-            }
-            return extractedUrl;
+            
+            const ytDlpProcess = spawn(YT_DLP_BINARY_PATH, currentArgs);
+            
+            return new Promise<Readable>((resolve, reject) => {
+                let errorData = '';
+                
+                ytDlpProcess.stdout.once('data', (chunk) => {
+                    ytDlpProcess.stdout.unshift(chunk); // Crucial: put the chunk back so ffmpeg can read the file header!
+                    resolve(ytDlpProcess.stdout);
+                });
+                
+                ytDlpProcess.stderr.on('data', (data) => {
+                    errorData += data.toString();
+                });
+                
+                ytDlpProcess.on('error', reject);
+                
+                ytDlpProcess.on('close', (code) => {
+                    if (code !== 0) {
+                        reject(new Error(`yt-dlp exited with code ${code}. Stderr: ${errorData.substring(0, 300)}`));
+                    }
+                });
+            });
         };
 
-        let extractedUrl: string;
+        let stream: Readable;
         try {
             console.log('[Stream] Trying yt-dlp WITH cookies...');
-            extractedUrl = await runYtDlp(true);
+            stream = await runYtDlp(true);
         } catch (err: any) {
             console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
             console.log('[Stream] Trying yt-dlp WITHOUT cookies as fallback...');
-            extractedUrl = await runYtDlp(false);
+            stream = await runYtDlp(false);
         }
 
-        console.log('[Stream] ✅ yt-dlp stream URL extracted successfully');
-        return { stream: extractedUrl }; // Return the raw URL directly to FFmpeg
+        console.log('[Stream] ✅ yt-dlp stream generated successfully');
+        return { stream }; 
     } catch (err: any) {
         console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 500));
-        if (err.stderr) {
-            console.log('[Stream] yt-dlp stderr:', err.stderr.substring(0, 500));
-        }
     }
 
     // Backend 2: Try play-dl
