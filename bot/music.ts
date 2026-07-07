@@ -84,13 +84,43 @@ let cookiesFilePath: string | undefined;
 
 cookiesFilePath = undefined;
 
-// Always prioritize the environment variable if present
-if (process.env.YOUTUBE_COOKIES) {
+// First priority: Local file (from user)
+const possiblePaths = [
+    path.join(process.cwd(), 'cookies.txt'),
+    path.resolve(__dirname, '..', 'cookies.txt'),
+    path.resolve(__dirname, 'cookies.txt'),
+];
+
+for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+        cookiesFilePath = p;
+        console.log(`[Cookies] ✅ Using local cookies file: ${p}`);
+        
+        try {
+            const cookieFileContent = fs.readFileSync(p, 'utf8');
+            let cookieStr = "";
+            for (const line of cookieFileContent.split('\n')) {
+                if (line.startsWith('#') || line.trim() === '') continue;
+                const parts = line.split('\t');
+                if (parts.length >= 7) {
+                    cookieStr += `${parts[5]}=${parts[6].trim()}; `;
+                }
+            }
+            if (cookieStr) {
+                play.setToken({ youtube: { cookie: cookieStr.trim() } });
+                console.log("[Cookies] ✅ YouTube cookies parsed from file and set for play-dl!");
+            }
+        } catch (e) {
+            console.error("Failed to parse local cookies.txt for play-dl:", e);
+        }
+        break;
+    }
+}
+
+// Fallback to ENV if file is missing
+if (!cookiesFilePath && process.env.YOUTUBE_COOKIES) {
     try {
         const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
-        ytdlAgent = ytdl.createAgent(cookies);
-        console.log("[Cookies] ✅ YouTube Cookies successfully loaded from ENV for ytdl-core!");
-        
         let netscape = "# Netscape HTTP Cookie File\n";
         let cookieStr = "";
         for (const cookie of cookies) {
@@ -105,34 +135,10 @@ if (process.env.YOUTUBE_COOKIES) {
         
         cookiesFilePath = path.join(process.cwd(), 'youtube-cookies-env.txt');
         fs.writeFileSync(cookiesFilePath, netscape);
-        console.log("[Cookies] ✅ YouTube cookies written to temporary file for yt-dlp!");
-
-        // Set cookies for play-dl as well
-        play.setToken({
-            youtube: {
-                cookie: cookieStr.trim()
-            }
-        });
-        console.log("[Cookies] ✅ YouTube cookies formatted and set for play-dl!");
-        
+        console.log("[Cookies] ✅ YouTube cookies loaded from ENV!");
+        play.setToken({ youtube: { cookie: cookieStr.trim() } });
     } catch (e) {
-        console.error("Failed to parse YOUTUBE_COOKIES (make sure it's a valid JSON array):", e);
-    }
-}
-
-// Fallback to local file if ENV is missing or failed
-if (!cookiesFilePath) {
-    const possiblePaths = [
-        path.join(process.cwd(), 'cookies.txt'),
-        path.resolve(__dirname, '..', 'cookies.txt'),
-        path.resolve(__dirname, 'cookies.txt'),
-    ];
-    for (const p of possiblePaths) {
-        if (fs.existsSync(p)) {
-            cookiesFilePath = p;
-            console.log(`[Cookies] ✅ Using local cookies file fallback: ${p}`);
-            break;
-        }
+        console.error("Failed to parse YOUTUBE_COOKIES:", e);
     }
 }
 
