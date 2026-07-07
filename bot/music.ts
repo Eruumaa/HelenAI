@@ -224,7 +224,8 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     await interaction.editReply("⏳ Loading playlist... This might take a moment.");
                     const data: any = await (ytDlp as any)(query, {
                         dumpSingleJson: true,
-                        flatPlaylist: true
+                        flatPlaylist: true,
+                        'extractor-args': 'youtube:player_client=android'
                     });
                     
                     if (!data || !data.entries || data.entries.length === 0) {
@@ -503,7 +504,8 @@ async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<Qu
             dumpSingleJson: true,
             flatPlaylist: true,
             'no-warnings': true,
-            'js-runtimes': 'node'
+            'js-runtimes': 'node',
+            'extractor-args': 'youtube:player_client=android'
         };
         if (cookiesFilePath) ytDlpInfoArgs.cookies = cookiesFilePath;
 
