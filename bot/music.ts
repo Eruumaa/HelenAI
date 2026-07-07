@@ -9,10 +9,11 @@ import {
 } from '@discordjs/voice';
 import { Readable } from 'stream';
 import play from 'play-dl';
-import ytDlp from 'yt-dlp-exec';
+import ytDlpExec from 'yt-dlp-exec';
 import ytdl from '@distube/ytdl-core';
 import fs from 'fs';
 import path from 'path';
+import https from 'https';
 // autoplay logic is handled inline in getAutoplaySongs below
 import { 
     Message, 
@@ -26,6 +27,47 @@ import {
 } from 'discord.js';
 
 let ytdlAgent: ytdl.Agent | undefined;
+let ytDlp: any;
+
+const YT_DLP_BINARY_PATH = path.join(process.cwd(), 'yt-dlp-binary');
+
+function downloadYtDlp() {
+    return new Promise<void>((resolve, reject) => {
+        const file = fs.createWriteStream(YT_DLP_BINARY_PATH);
+        https.get('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', (res) => {
+            if (res.statusCode === 301 || res.statusCode === 302) {
+                https.get(res.headers.location!, (res2) => {
+                    res2.pipe(file);
+                    file.on('finish', () => {
+                        file.close();
+                        fs.chmodSync(YT_DLP_BINARY_PATH, '755');
+                        resolve();
+                    });
+                }).on('error', reject);
+            } else {
+                res.pipe(file);
+                file.on('finish', () => {
+                    file.close();
+                    fs.chmodSync(YT_DLP_BINARY_PATH, '755');
+                    resolve();
+                });
+            }
+        }).on('error', reject);
+    });
+}
+
+// Download latest yt-dlp on startup if missing, or create it directly if found
+if (!fs.existsSync(YT_DLP_BINARY_PATH)) {
+    console.log("[Setup] Downloading latest yt-dlp binary because it's missing...");
+    downloadYtDlp().then(() => {
+        ytDlp = ytDlpExec.create(YT_DLP_BINARY_PATH);
+        console.log("[Setup] ✅ yt-dlp binary downloaded and ready.");
+    }).catch(err => console.error("[Setup] ❌ Failed to download yt-dlp:", err));
+} else {
+    ytDlp = ytDlpExec.create(YT_DLP_BINARY_PATH);
+    console.log("[Setup] ✅ Local yt-dlp binary found and ready.");
+}
+
 let cookiesFilePath: string | undefined;
 
 cookiesFilePath = undefined;
@@ -448,27 +490,7 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
         console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
     }
 
-    // Backend 3: Try SoundCloud Fallback if YouTube completely blocks the stream
-    if (title) {
-        try {
-            console.log('[Stream] YouTube completely blocked the request. Trying SoundCloud fallback for:', title);
-            const clientId = await play.getFreeClientID();
-            play.setToken({ soundcloud: { client_id: clientId } });
-            
-            const scSearch = await play.search(title, { source: { soundcloud: 'tracks' }, limit: 1 });
-            if (scSearch && scSearch.length > 0) {
-                const playStream = await play.stream(scSearch[0].url);
-                console.log('[Stream] ✅ SoundCloud fallback stream started successfully');
-                return { stream: playStream.stream as unknown as Readable };
-            } else {
-                throw new Error("No matching track found on SoundCloud.");
-            }
-        } catch (err: any) {
-            console.log('[Stream] ❌ SoundCloud fallback failed:', err.message?.substring(0, 100));
-        }
-    }
-
-    throw new Error('All stream backends (yt-dlp, play-dl, ytdl-core, soundcloud) failed to start the audio stream.');
+    throw new Error('All YouTube extractors failed to bypass bot protection.');
 }
 
 async function playNextSong(guildId: string) {
