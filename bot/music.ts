@@ -458,26 +458,36 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
     // Backend 1: Try yt-dlp (URL extraction)
     try {
         console.log('[Stream] Trying yt-dlp...');
-        const ytDlpArgs: any = {
-            dumpJson: true,
-            format: 'bestaudio', // strictly audio to avoid downloading silent storyboards
-            'no-warnings': true,
-            'extractor-args': 'youtube:player_client=default,android,ios,web'
-        };
+        const ytDlpArgs = [
+            '--get-url',
+            '-f', 'bestaudio',
+            '--no-warnings',
+            '--extractor-args', 'youtube:player_client=default,android,ios,web',
+            url
+        ];
+        
         if (cookiesFilePath) {
-            ytDlpArgs.cookies = cookiesFilePath;
+            ytDlpArgs.unshift('--cookies', cookiesFilePath);
         }
 
-        const info = await (ytDlp as any)(url, ytDlpArgs);
+        const { execa } = await import('execa');
+        const { stdout, stderr } = await execa(YT_DLP_BINARY_PATH, ytDlpArgs);
         
-        if (!info || !info.url) {
+        const extractedUrl = stdout.trim().split('\n').pop(); // Get the last line in case there are warnings
+        
+        if (!extractedUrl || !extractedUrl.startsWith('http')) {
+            console.log('[Stream] yt-dlp stdout:', stdout);
+            console.log('[Stream] yt-dlp stderr:', stderr);
             throw new Error('yt-dlp did not return a valid stream URL');
         }
 
         console.log('[Stream] ✅ yt-dlp stream URL extracted successfully');
-        return { stream: info.url }; // Return the raw URL directly to FFmpeg
+        return { stream: extractedUrl }; // Return the raw URL directly to FFmpeg
     } catch (err: any) {
-        console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 100));
+        console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 500));
+        if (err.stderr) {
+            console.log('[Stream] yt-dlp stderr:', err.stderr.substring(0, 500));
+        }
     }
 
     // Backend 2: Try play-dl
