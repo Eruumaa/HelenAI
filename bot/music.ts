@@ -225,7 +225,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     const data: any = await (ytDlp as any)(query, {
                         dumpSingleJson: true,
                         flatPlaylist: true,
-                        'extractor-args': 'youtube:player_client=android'
+                        'extractor-args': 'youtube:player_client=default,android,ios,web'
                     });
                     
                     if (!data || !data.entries || data.entries.length === 0) {
@@ -433,7 +433,7 @@ async function playNextSong(guildId: string) {
             limitRate: '1M',
             rmCacheDir: true,
             'no-warnings': true,
-            'extractor-args': 'youtube:player_client=android'
+            'extractor-args': 'youtube:player_client=default,android,ios,web'
         };
         
         if (cookiesFilePath) {
@@ -508,7 +508,7 @@ async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<Qu
             flatPlaylist: true,
             'no-warnings': true,
             'js-runtimes': 'node',
-            'extractor-args': 'youtube:player_client=android'
+            'extractor-args': 'youtube:player_client=default,android,ios,web'
         };
         if (cookiesFilePath) ytDlpInfoArgs.cookies = cookiesFilePath;
 
