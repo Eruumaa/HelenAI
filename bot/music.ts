@@ -52,6 +52,15 @@ if (process.env.YOUTUBE_COOKIES) {
     }
 }
 
+// Fallback: if no env var cookies, check for a cookies.txt file in the project root
+if (!cookiesFilePath) {
+    const localCookiesPath = path.join(process.cwd(), 'cookies.txt');
+    if (fs.existsSync(localCookiesPath)) {
+        cookiesFilePath = localCookiesPath;
+        console.log("Found cookies.txt file in project root, using it for yt-dlp!");
+    }
+}
+
 if (process.env.YOUTUBE_COOKIE) {
     play.setToken({
         youtube: {
