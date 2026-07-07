@@ -71,11 +71,12 @@ if (fs.existsSync(YT_DLP_BINARY_PATH)) {
 if (needsDownload) {
     console.log("[Setup] Downloading latest yt-dlp binary...");
     downloadYtDlp().then(() => {
-        ytDlp = ytDlpExec.create(YT_DLP_BINARY_PATH);
         console.log("[Setup] ✅ yt-dlp binary downloaded and ready.");
     }).catch(err => console.error("[Setup] ❌ Failed to download yt-dlp:", err));
 } else {
-    ytDlp = ytDlpExec.create(YT_DLP_BINARY_PATH);
+    try {
+        fs.chmodSync(YT_DLP_BINARY_PATH, '755');
+    } catch (e) {}
     console.log("[Setup] ✅ Local yt-dlp binary found and ready.");
 }
 
