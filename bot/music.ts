@@ -414,7 +414,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
-async function getAudioStream(url: string): Promise<{ stream: Readable; type: StreamType }> {
+async function getAudioStream(url: string): Promise<{ stream: Readable }> {
     // Backend 1: Try yt-dlp
     try {
         console.log('[Stream] Trying yt-dlp...');
@@ -433,36 +433,37 @@ async function getAudioStream(url: string): Promise<{ stream: Readable; type: St
 
         const proc = (ytDlp as any).exec(url, ytDlpArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
         
-        // Collect stderr to check for errors
-        let stderrData = '';
-        proc.stderr?.on('data', (chunk: Buffer) => {
-            stderrData += chunk.toString();
-        });
+        // Pipe stdout through a PassThrough so we don't lose any data
+        const { PassThrough } = require('stream');
+        const passthrough = new PassThrough();
+        proc.stdout?.pipe(passthrough);
 
-        // Wait briefly to see if yt-dlp errors out immediately
+        // Wait briefly to detect errors from stderr, without touching stdout
         await new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => resolve(), 3000);
             proc.on('error', (err: Error) => {
                 clearTimeout(timeout);
                 reject(err);
             });
-            proc.stderr?.once('data', (chunk: Buffer) => {
+            proc.stderr?.on('data', (chunk: Buffer) => {
                 const msg = chunk.toString();
                 if (msg.includes('ERROR') || msg.includes('Sign in')) {
                     clearTimeout(timeout);
+                    proc.kill();
                     reject(new Error(msg.trim()));
                 }
             });
-            // If stdout gets data, yt-dlp is working
-            proc.stdout?.once('data', () => {
+            // If passthrough gets data, yt-dlp is working — but don't consume it
+            passthrough.once('data', (chunk: Buffer) => {
                 clearTimeout(timeout);
+                // IMPORTANT: push the chunk back so it's not lost
+                passthrough.unshift(chunk);
                 resolve();
             });
         });
 
-        if (!proc.stdout) throw new Error('yt-dlp did not return a stream');
         console.log('[Stream] ✅ yt-dlp stream started successfully');
-        return { stream: proc.stdout, type: StreamType.Arbitrary };
+        return { stream: passthrough };
     } catch (err: any) {
         console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 100));
     }
@@ -472,7 +473,7 @@ async function getAudioStream(url: string): Promise<{ stream: Readable; type: St
         console.log('[Stream] Trying play-dl...');
         const playStream = await play.stream(url);
         console.log('[Stream] ✅ play-dl stream started successfully');
-        return { stream: playStream.stream as unknown as Readable, type: playStream.type as unknown as StreamType };
+        return { stream: playStream.stream as unknown as Readable };
     } catch (err: any) {
         console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
     }
@@ -487,7 +488,7 @@ async function getAudioStream(url: string): Promise<{ stream: Readable; type: St
             ...(ytdlAgent ? { agent: ytdlAgent } : {})
         });
         console.log('[Stream] ✅ ytdl-core stream started successfully');
-        return { stream: ytdlStream as unknown as Readable, type: StreamType.Arbitrary };
+        return { stream: ytdlStream as unknown as Readable };
     } catch (err: any) {
         console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
     }
@@ -533,8 +534,7 @@ async function playNextSong(guildId: string) {
         const streamResult = await getAudioStream(song.url);
         
         const resource = createAudioResource(streamResult.stream, { 
-            inlineVolume: true,
-            inputType: streamResult.type 
+            inlineVolume: true
         });
         if (resource.volume) {
             resource.volume.setVolume(serverQueue.volume);
