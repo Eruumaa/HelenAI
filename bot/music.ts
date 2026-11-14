@@ -383,7 +383,7 @@ async function fetchYtDlpJson(target: string, extraFlags: Record<string, any> = 
             forceIpv4: true,
             extractorArgs: useCookies
                 ? 'youtube:player_client=tv,web,mweb'
-                : 'youtube:player_client=default,android,ios,tv',
+                : 'youtube:player_client=android_vr,default,android,ios,tv',
             ...extraFlags
         };
         if (isNightly) {
@@ -829,6 +829,17 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
+function createAudioStartGuard(output: PassThrough, onReady: () => void): () => void {
+    const onReadable = () => {
+        // Node's PassThrough emits 'readable' on 0-byte EOF; wait for actual audio bytes.
+        if (output.readableLength === 0) return;
+        output.off('readable', onReadable);
+        onReady();
+    };
+    output.on('readable', onReadable);
+    return () => output.off('readable', onReadable);
+}
+
 function waitForReadableStream(source: Readable, onCleanup?: () => void, timeoutMs = 20_000): Promise<Readable> {
     return new Promise((resolve, reject) => {
         const output = new PassThrough({ highWaterMark: 256 * 1024 });
@@ -842,8 +853,16 @@ function waitForReadableStream(source: Readable, onCleanup?: () => void, timeout
             }
         }, timeoutMs);
 
+        const cleanupGuard = createAudioStartGuard(output, () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(output);
+        });
+
         const cleanupSource = () => {
             clearTimeout(timer);
+            cleanupGuard();
             source.unpipe(output);
             if (!source.destroyed) source.destroy();
             if (!output.destroyed) output.destroy();
@@ -851,13 +870,6 @@ function waitForReadableStream(source: Readable, onCleanup?: () => void, timeout
         };
 
         source.pipe(output);
-
-        output.once('readable', () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            resolve(output);
-        });
 
         output.on('close', () => {
             onCleanup?.();
@@ -894,7 +906,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
         '--no-warnings',
         '--force-ipv4',
         '--extractor-args',
-        useCookies ? 'youtube:player_client=tv,web,mweb' : 'youtube:player_client=ios,android,tv',
+        useCookies ? 'youtube:player_client=tv,web,mweb' : 'youtube:player_client=android_vr,ios,android,tv',
         url
     ];
 
@@ -934,9 +946,17 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
         const output = new PassThrough({ highWaterMark: 256 * 1024 });
         let settled = false;
 
+        const cleanupGuard = createAudioStartGuard(output, () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(output);
+        });
+
         const timer = setTimeout(() => {
             if (!settled) {
                 settled = true;
+                cleanupGuard();
                 killProcess();
                 if (!output.destroyed) output.destroy();
                 reject(new Error(`yt-dlp timed out waiting for audio data. Stderr: ${errorData.substring(0, 300)}`));
@@ -946,14 +966,18 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
         ytDlpProcess.stdout.on('error', () => {});
         ytDlpProcess.stdout.pipe(output);
 
-        output.once('readable', () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            resolve(output);
+        output.once('end', () => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                cleanupGuard();
+                if (!output.destroyed) output.destroy();
+                reject(new Error(`yt-dlp ended without audio output. Stderr: ${errorData.substring(0, 300)}`));
+            }
         });
 
         output.on('close', () => {
+            cleanupGuard();
             killProcess();
         });
 
@@ -961,6 +985,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
             if (!settled) {
                 settled = true;
                 clearTimeout(timer);
+                cleanupGuard();
                 if (!output.destroyed) output.destroy();
                 reject(err);
             } else if (!output.destroyed) {
@@ -972,6 +997,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
             if (!settled) {
                 settled = true;
                 clearTimeout(timer);
+                cleanupGuard();
                 if (!output.destroyed) output.destroy();
                 reject(new Error(`yt-dlp exited with code ${code} before producing audio. Stderr: ${errorData.substring(0, 300)}`));
             } else if (code !== 0 && !output.destroyed) {
