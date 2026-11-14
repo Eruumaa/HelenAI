@@ -831,7 +831,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
 
 function waitForReadableStream(source: Readable, onCleanup?: () => void, timeoutMs = 20_000): Promise<Readable> {
     return new Promise((resolve, reject) => {
-        const output = new PassThrough({ highWaterMark: 1 << 20 });
+        const output = new PassThrough({ highWaterMark: 256 * 1024 });
         let settled = false;
 
         const timer = setTimeout(() => {
@@ -931,7 +931,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
     };
 
     return new Promise<Readable>((resolve, reject) => {
-        const output = new PassThrough({ highWaterMark: 1 << 20 });
+        const output = new PassThrough({ highWaterMark: 256 * 1024 });
         let settled = false;
 
         const timer = setTimeout(() => {
@@ -1020,7 +1020,7 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
         console.log('[Stream] Trying ytdl-core...');
         const rawStream = ytdl(url, {
             filter: 'audioonly',
-            highWaterMark: 1 << 25,
+            highWaterMark: 1 << 20,
             agent: ytdlAgent
         });
         const stream = await waitForReadableStream(rawStream);
