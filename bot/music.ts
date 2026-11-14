@@ -5,6 +5,7 @@ import {
     AudioPlayerStatus,
     VoiceConnectionStatus,
     entersState,
+    StreamType,
     AudioPlayer,
     VoiceConnection,
     AudioResource
@@ -28,6 +29,34 @@ import {
 } from 'discord.js';
 
 const IS_WINDOWS = process.platform === 'win32';
+
+function getContainerMemoryLimitMB(): number | null {
+    if (process.env.LOW_MEMORY_MODE === 'true') return 256;
+    if (process.env.LOW_MEMORY_MODE === 'false') return null;
+
+    const cgroupPaths = [
+        '/sys/fs/cgroup/memory.max',
+        '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+    ];
+    for (const cgPath of cgroupPaths) {
+        try {
+            if (!fs.existsSync(cgPath)) continue;
+            const raw = fs.readFileSync(cgPath, 'utf8').trim();
+            if (raw === 'max') continue;
+            const bytes = Number.parseInt(raw, 10);
+            if (Number.isFinite(bytes) && bytes > 0 && bytes < 64 * 1024 * 1024 * 1024) {
+                return Math.round(bytes / (1024 * 1024));
+            }
+        } catch {
+            // Ignore non-Linux / inaccessible cgroup paths
+        }
+    }
+    return null;
+}
+
+const CONTAINER_MEMORY_LIMIT_MB = getContainerMemoryLimitMB();
+const IS_LOW_MEMORY = CONTAINER_MEMORY_LIMIT_MB !== null && CONTAINER_MEMORY_LIMIT_MB <= 384;
+
 const YT_DLP_BINARY_NAME = IS_WINDOWS
     ? 'yt-dlp.exe'
     : process.platform === 'darwin'
@@ -181,19 +210,23 @@ function ensureQuickJs(): Promise<string | null> {
 
 // Kick off binary checks/downloads at startup without blocking HTTP server boot
 ensureYtDlp().catch((err) => console.error('[Setup] yt-dlp init error:', err));
-ensureQuickJs().catch((err) => console.error('[Setup] QuickJS init error:', err));
+if (IS_LOW_MEMORY) {
+    console.log(`[Setup] ℹ️ Container memory limit ${CONTAINER_MEMORY_LIMIT_MB} MB detected — enabling low-memory SoundCloud streaming mode.`);
+} else {
+    ensureQuickJs().catch((err) => console.error('[Setup] QuickJS init error:', err));
+}
 
-let ffmpegInitPromise: Promise<void> | null = null;
-function ensureFfmpeg(): Promise<void> {
+let ffmpegInitPromise: Promise<string> | null = null;
+function ensureFfmpeg(): Promise<string> {
     if (ffmpegInitPromise) return ffmpegInitPromise;
 
     ffmpegInitPromise = (async () => {
         try {
             const prismMod: any = await import('prism-media');
             const FFmpeg = prismMod.default?.FFmpeg ?? prismMod.FFmpeg;
-            FFmpeg.getInfo(true);
+            const info = FFmpeg.getInfo(true);
             console.log('[Setup] ✅ FFmpeg found and ready.');
-            return;
+            return info?.command || 'ffmpeg';
         } catch {
             console.log('[Setup] FFmpeg missing (install script may have been skipped); downloading via ffmpeg-static...');
         }
@@ -201,10 +234,10 @@ function ensureFfmpeg(): Promise<void> {
         const installerPath = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'install.js');
         if (!fs.existsSync(installerPath)) {
             console.warn('[Setup] ⚠️ ffmpeg-static installer not found; audio playback requires system ffmpeg.');
-            return;
+            return 'ffmpeg';
         }
 
-        await new Promise<void>((resolve) => {
+        return await new Promise<string>((resolve) => {
             const proc = spawn(process.execPath, [installerPath], {
                 cwd: path.dirname(installerPath),
                 stdio: 'inherit'
@@ -214,19 +247,20 @@ function ensureFfmpeg(): Promise<void> {
                     try {
                         const prismMod: any = await import('prism-media');
                         const FFmpeg = prismMod.default?.FFmpeg ?? prismMod.FFmpeg;
-                        FFmpeg.getInfo(true);
+                        const info = FFmpeg.getInfo(true);
                         console.log('[Setup] ✅ FFmpeg installed and ready.');
+                        return resolve(info?.command || 'ffmpeg');
                     } catch (err: any) {
                         console.warn('[Setup] ⚠️ FFmpeg downloaded, check warning:', err?.message);
                     }
                 } else {
                     console.error(`[Setup] ❌ ffmpeg-static installer exited with code ${code}`);
                 }
-                resolve();
+                resolve('ffmpeg');
             });
             proc.on('error', (err) => {
                 console.error('[Setup] ❌ Failed to run ffmpeg-static installer:', err);
-                resolve();
+                resolve('ffmpeg');
             });
         });
     })();
@@ -405,28 +439,35 @@ function isYouTubePlaylistUrl(url: string): boolean {
 }
 
 async function fetchYtDlpJson(target: string, extraFlags: Record<string, any> = {}): Promise<any> {
-    const [{ client, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
+    const isSoundCloud = target.startsWith('scsearch') || target.includes('soundcloud.com');
+    const needJs = !IS_LOW_MEMORY && !isSoundCloud && !extraFlags.flatPlaylist;
+    const [{ client, isNightly }, qjsPath] = await Promise.all([
+        ensureYtDlp(),
+        needJs ? ensureQuickJs() : Promise.resolve(null)
+    ]);
 
     const buildFlags = (useCookies: boolean) => {
         const flags: Record<string, any> = {
             dumpSingleJson: true,
             noWarnings: true,
             forceIpv4: true,
-            extractorArgs: useCookies
-                ? 'youtube:player_client=mweb,web'
-                : 'youtube:player_client=android_vr,default,android,ios,tv',
             ...extraFlags
         };
-        if (isNightly && useCookies && !extraFlags.flatPlaylist) {
+        if (!isSoundCloud) {
+            flags.extractorArgs = useCookies
+                ? 'youtube:player_client=mweb,web'
+                : 'youtube:player_client=android_vr,default,android,ios,tv';
+        }
+        if (isNightly && useCookies && needJs) {
             flags.jsRuntimes = qjsPath ? `quickjs:${qjsPath}` : 'node';
         }
-        if (useCookies && cookiesFilePath) {
+        if (useCookies && cookiesFilePath && !isSoundCloud) {
             flags.cookies = cookiesFilePath;
         }
         return flags;
     };
 
-    if (cookiesFilePath) {
+    if (cookiesFilePath && !isSoundCloud) {
         try {
             return await (client as any)(target, buildFlags(true));
         } catch (err) {
@@ -475,6 +516,81 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
     });
 }
 
+let soundCloudClientPromise: Promise<void> | null = null;
+function ensureSoundCloudClient(): Promise<void> {
+    if (soundCloudClientPromise) return soundCloudClientPromise;
+
+    soundCloudClientPromise = (async () => {
+        try {
+            const clientId = await withTimeout(play.getFreeClientID(), 8_000, 'play.getFreeClientID');
+            await play.setToken({ soundcloud: { client_id: clientId } });
+            console.log('[Setup] ✅ SoundCloud search client initialized.');
+        } catch (err) {
+            soundCloudClientPromise = null;
+            throw err;
+        }
+    })();
+
+    return soundCloudClientPromise;
+}
+
+function mapSoundCloudTrack(track: any, requestedBy: string, isAutoplay = false): QueueItem | null {
+    const trackUrl = track?.permalink || track?.url;
+    if (!trackUrl) return null;
+    return {
+        title: track.name || 'Unknown Title',
+        url: trackUrl,
+        requestedBy,
+        thumbnail: track.thumbnail,
+        duration: track.durationInSec ? formatDurationSeconds(track.durationInSec) : 'Unknown',
+        channel: track.user?.name || 'SoundCloud',
+        isAutoplay
+    };
+}
+
+async function searchSoundCloudTrack(searchStr: string, requestedBy: string, isAutoplay = false): Promise<QueueItem | null> {
+    try {
+        await ensureSoundCloudClient();
+        const results: any[] = await withTimeout(
+            play.search(searchStr, { limit: 6, source: { soundcloud: 'tracks' } }),
+            8_000,
+            'play.search(soundcloud)'
+        );
+        if (results && results.length > 0) {
+            // Skip 30-second Go+ previews when a full track/re-upload exists
+            const picked = results.find((r) => (r.durationInSec ?? 0) > 35) || results[0];
+            const item = mapSoundCloudTrack(picked, requestedBy, isAutoplay);
+            if (item) return item;
+        }
+    } catch (err) {
+        console.warn('[Search] play-dl SoundCloud search failed, falling back to yt-dlp:', (err as any)?.message?.substring(0, 120));
+    }
+
+    try {
+        const data = await fetchYtDlpJson(`scsearch5:${searchStr}`, { flatPlaylist: true });
+        const entries: any[] = Array.isArray(data?.entries) ? data.entries : data ? [data] : [];
+        const picked = entries.find((e) => (e?.duration ?? 0) > 35) || entries[0];
+        return picked ? mapYtDlpEntryToQueueItem(picked, requestedBy, isAutoplay) : null;
+    } catch (err) {
+        console.error('[Search] yt-dlp SoundCloud search failed:', (err as any)?.message?.substring(0, 200));
+        return null;
+    }
+}
+
+async function fetchYouTubeTitleViaOembed(url: string): Promise<string | null> {
+    try {
+        const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, {
+            signal: AbortSignal.timeout(5_000)
+        });
+        if (!res.ok) return null;
+        const data: any = await res.json();
+        if (!data?.title) return null;
+        return data.author_name ? `${data.title} ${data.author_name}` : String(data.title);
+    } catch {
+        return null;
+    }
+}
+
 async function searchYouTubeTrack(searchStr: string, requestedBy: string): Promise<QueueItem | null> {
     // 1. Try play-dl search with short timeout
     try {
@@ -504,6 +620,13 @@ async function searchYouTubeTrack(searchStr: string, requestedBy: string): Promi
         console.error('[Search] yt-dlp search also failed:', (err as any)?.message?.substring(0, 200));
         return null;
     }
+}
+
+async function searchTrack(searchStr: string, requestedBy: string): Promise<QueueItem | null> {
+    if (IS_LOW_MEMORY) {
+        return await searchSoundCloudTrack(searchStr, requestedBy);
+    }
+    return await searchYouTubeTrack(searchStr, requestedBy);
 }
 
 function destroyQueue(guildId: string) {
@@ -680,7 +803,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     }
 
                     for (const searchStr of tracksToSearch) {
-                        const song = await searchYouTubeTrack(searchStr, interaction.user.username);
+                        const song = await searchTrack(searchStr, interaction.user.username);
                         if (song) songsToAdd.push(song);
                     }
                 } catch (err) {
@@ -704,22 +827,34 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     console.error("Playlist error:", err);
                     return interaction.editReply("There was an error loading the playlist.");
                 }
+            } else if (IS_LOW_MEMORY && (query.includes('youtube.com') || query.includes('youtu.be'))) {
+                const titleQuery = await fetchYouTubeTitleViaOembed(query);
+                if (!titleQuery) {
+                    return interaction.editReply("Sorry, I couldn't read that YouTube link in low-memory mode.");
+                }
+                const song = await searchSoundCloudTrack(titleQuery, interaction.user.username);
+                if (!song) {
+                    return interaction.editReply(`I couldn't find **${titleQuery}** on SoundCloud.`);
+                }
+                songsToAdd.push(song);
             } else {
-                // Single URL: try play-dl first, then fall back to yt-dlp metadata
+                // Single URL: try play-dl first (non-SoundCloud), then fall back to yt-dlp metadata
                 let loaded = false;
-                try {
-                    const data = await withTimeout(play.video_info(query), 8_000, 'play.video_info');
-                    songsToAdd.push({
-                        title: data.video_details.title || 'Unknown Title',
-                        url: data.video_details.url,
-                        requestedBy: interaction.user.username,
-                        thumbnail: data.video_details.thumbnails[0]?.url,
-                        duration: data.video_details.durationRaw,
-                        channel: data.video_details.channel?.name
-                    });
-                    loaded = true;
-                } catch (err) {
-                    console.warn("[URL] play.video_info failed, trying yt-dlp fallback:", (err as any)?.message?.substring(0, 120));
+                if (!query.includes('soundcloud.com')) {
+                    try {
+                        const data = await withTimeout(play.video_info(query), 8_000, 'play.video_info');
+                        songsToAdd.push({
+                            title: data.video_details.title || 'Unknown Title',
+                            url: data.video_details.url,
+                            requestedBy: interaction.user.username,
+                            thumbnail: data.video_details.thumbnails[0]?.url,
+                            duration: data.video_details.durationRaw,
+                            channel: data.video_details.channel?.name
+                        });
+                        loaded = true;
+                    } catch (err) {
+                        console.warn("[URL] play.video_info failed, trying yt-dlp fallback:", (err as any)?.message?.substring(0, 120));
+                    }
                 }
 
                 if (!loaded) {
@@ -734,7 +869,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 }
             }
         } else {
-            const song = await searchYouTubeTrack(query, interaction.user.username);
+            const song = await searchTrack(query, interaction.user.username);
             if (!song) {
                 return interaction.editReply("I couldn't find any results for that search.");
             }
@@ -931,37 +1066,50 @@ function buildYtDlpArgs(
     useCookies: boolean,
     isNightly: boolean,
     qjsPath: string | null,
-    outputModeArgs: string[]
+    outputModeArgs: string[],
+    allowJsRuntime: boolean
 ): string[] {
+    const isSoundCloud = url.includes('soundcloud.com');
     const args = [
         ...outputModeArgs,
         '-f', 'bestaudio/best',
         '--no-playlist',
         '--no-progress',
         '--no-warnings',
-        '--force-ipv4',
-        '--extractor-args',
-        useCookies ? 'youtube:player_client=mweb,web' : 'youtube:player_client=android_vr,ios,android,tv',
-        url
+        '--force-ipv4'
     ];
 
-    if (isNightly && useCookies) {
-        args.splice(outputModeArgs.length, 0, '--js-runtimes', qjsPath ? `quickjs:${qjsPath}` : 'node');
+    if (!isSoundCloud) {
+        args.push(
+            '--extractor-args',
+            useCookies ? 'youtube:player_client=mweb,web' : 'youtube:player_client=android_vr,ios,android,tv'
+        );
     }
-    if (useCookies && cookiesFilePath) {
+
+    if (allowJsRuntime && isNightly && useCookies && !isSoundCloud) {
+        args.push('--js-runtimes', qjsPath ? `quickjs:${qjsPath}` : 'node');
+    } else if (!allowJsRuntime) {
+        args.push('--no-js-runtimes');
+    }
+
+    if (useCookies && cookiesFilePath && !isSoundCloud) {
         args.unshift('--cookies', cookiesFilePath);
     }
 
+    args.push(url);
     return args;
 }
 
 /**
- * Extracts the direct googlevideo audio URL and lets yt-dlp + QuickJS exit before ffmpeg starts,
+ * Extracts a direct audio/HLS URL and lets yt-dlp exit before ffmpeg starts,
  * cutting peak RAM usage on tight 256 MB containers.
  */
-async function resolveDirectAudioUrl(url: string, useCookies: boolean): Promise<string> {
-    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
-    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-g']);
+async function resolveDirectAudioUrl(url: string, useCookies: boolean, allowJsRuntime: boolean): Promise<string> {
+    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([
+        ensureYtDlp(),
+        allowJsRuntime ? ensureQuickJs() : Promise.resolve(null)
+    ]);
+    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-g'], allowJsRuntime);
 
     const ytDlpProcess = spawn(binaryPath, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1011,9 +1159,46 @@ async function resolveDirectAudioUrl(url: string, useCookies: boolean): Promise<
     });
 }
 
+async function spawnFfmpegUrlStream(audioUrl: string): Promise<{ stream: Readable; inputType: StreamType }> {
+    const ffmpegPath = await ensureFfmpeg();
+    const ffmpegProcess = spawn(ffmpegPath, [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', audioUrl,
+        '-analyzeduration', '0',
+        '-loglevel', 'error',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        'pipe:1'
+    ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+    });
+
+    ffmpegProcess.stderr.on('data', (chunk) => {
+        const msg = chunk.toString().trim();
+        if (msg) console.warn(`[FFmpeg stderr] ${msg}`);
+    });
+
+    const killFfmpeg = () => {
+        if (!ffmpegProcess.killed) {
+            try {
+                ffmpegProcess.kill('SIGTERM');
+            } catch {
+                // Ignore kill errors
+            }
+        }
+    };
+
+    const stream = await waitForReadableStream(ffmpegProcess.stdout, killFfmpeg, 20_000);
+    return { stream, inputType: StreamType.Raw };
+}
+
 async function fetchDirectAudioStream(audioUrl: string): Promise<Readable> {
     if (audioUrl.includes('.m3u8') || audioUrl.includes('manifest.googlevideo.com')) {
-        throw new Error('HLS manifest requires yt-dlp pipe fallback');
+        throw new Error('HLS manifest requires ffmpeg/yt-dlp fallback');
     }
 
     const controller = new AbortController();
@@ -1036,9 +1221,25 @@ async function fetchDirectAudioStream(audioUrl: string): Promise<Readable> {
     }
 }
 
-async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readable> {
-    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
-    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-o', '-']);
+async function streamSoundCloudUrl(scUrl: string): Promise<{ stream: Readable; inputType?: StreamType }> {
+    const directUrl = await resolveDirectAudioUrl(scUrl, false, false);
+    if (directUrl.includes('.m3u8')) {
+        return await spawnFfmpegUrlStream(directUrl);
+    }
+    try {
+        const stream = await fetchDirectAudioStream(directUrl);
+        return { stream };
+    } catch {
+        return await spawnFfmpegUrlStream(directUrl);
+    }
+}
+
+async function runYtDlpStream(url: string, useCookies: boolean, allowJsRuntime: boolean): Promise<Readable> {
+    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([
+        ensureYtDlp(),
+        allowJsRuntime ? ensureQuickJs() : Promise.resolve(null)
+    ]);
+    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-o', '-'], allowJsRuntime);
 
     const ytDlpProcess = spawn(binaryPath, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1130,33 +1331,41 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
     });
 }
 
-async function getAudioStream(url: string): Promise<{ stream: Readable }> {
-    // Backend 1: yt-dlp with cookies (QuickJS + direct HTTP streaming keeps peak RAM under 256 MB)
-    if (cookiesFilePath) {
-        try {
-            console.log('[Stream] Resolving audio URL via yt-dlp + QuickJS (WITH cookies)...');
-            const directUrl = await resolveDirectAudioUrl(url, true);
-            const stream = await fetchDirectAudioStream(directUrl);
-            console.log('[Stream] ✅ Direct HTTP audio stream started (yt-dlp + qjs exited)');
-            return { stream };
-        } catch (err: any) {
-            console.log('[Stream] ⚠️ Direct URL stream failed, trying yt-dlp pipe:', err.message?.substring(0, 200));
-        }
+async function getAudioStream(url: string, songTitle?: string): Promise<{ stream: Readable; inputType?: StreamType }> {
+    if (url.includes('soundcloud.com')) {
+        console.log('[Stream] Streaming SoundCloud track via yt-dlp -g + FFmpeg...');
+        return await streamSoundCloudUrl(url);
+    }
 
-        try {
-            console.log('[Stream] Trying yt-dlp pipe WITH cookies...');
-            const stream = await runYtDlpStream(url, true);
-            console.log('[Stream] ✅ yt-dlp (cookies) stream started');
-            return { stream };
-        } catch (err: any) {
-            console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
+    // On <=384 MB containers, avoid spawning yt-dlp's >200 MB player.js AST solver
+    if (!IS_LOW_MEMORY) {
+        // Backend 1: yt-dlp with cookies + QuickJS
+        if (cookiesFilePath) {
+            try {
+                console.log('[Stream] Resolving audio URL via yt-dlp + QuickJS (WITH cookies)...');
+                const directUrl = await resolveDirectAudioUrl(url, true, true);
+                const stream = await fetchDirectAudioStream(directUrl);
+                console.log('[Stream] ✅ Direct HTTP audio stream started (yt-dlp + qjs exited)');
+                return { stream };
+            } catch (err: any) {
+                console.log('[Stream] ⚠️ Direct URL stream failed, trying yt-dlp pipe:', err.message?.substring(0, 200));
+            }
+
+            try {
+                console.log('[Stream] Trying yt-dlp pipe WITH cookies...');
+                const stream = await runYtDlpStream(url, true, true);
+                console.log('[Stream] ✅ yt-dlp (cookies) stream started');
+                return { stream };
+            } catch (err: any) {
+                console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
+            }
         }
     }
 
-    // Backend 2: yt-dlp without cookies (anonymous mobile/TV clients)
+    // Backend 2: yt-dlp without cookies or JS runtime (anonymous mobile clients)
     try {
-        console.log('[Stream] Trying yt-dlp WITHOUT cookies...');
-        const stream = await runYtDlpStream(url, false);
+        console.log('[Stream] Trying yt-dlp WITHOUT JS runtime/cookies...');
+        const stream = await runYtDlpStream(url, false, false);
         console.log('[Stream] ✅ yt-dlp (anonymous) stream started');
         return { stream };
     } catch (err: any) {
@@ -1189,7 +1398,22 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
         console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 150));
     }
 
-    throw new Error('All YouTube extractors failed to bypass bot protection.');
+    // Backend 5: SoundCloud fallback by song title
+    if (songTitle) {
+        try {
+            console.log(`[Stream] Trying SoundCloud fallback for "${songTitle}"...`);
+            const scTrack = await searchSoundCloudTrack(songTitle, 'Helen');
+            if (scTrack) {
+                const res = await streamSoundCloudUrl(scTrack.url);
+                console.log(`[Stream] ✅ SoundCloud fallback started: ${scTrack.title}`);
+                return res;
+            }
+        } catch (err: any) {
+            console.log('[Stream] ❌ SoundCloud fallback failed:', err.message?.substring(0, 150));
+        }
+    }
+
+    throw new Error('All audio extractors failed to play this track.');
 }
 
 async function playNextSong(guildId: string) {
@@ -1217,13 +1441,14 @@ async function playNextSong(guildId: string) {
 
             try {
                 await ensureFfmpeg();
-                const streamResult = await getAudioStream(song.url);
+                const streamResult = await getAudioStream(song.url, song.title);
                 if (!queue.has(guildId)) {
                     streamResult.stream.destroy();
                     return;
                 }
 
                 const resource = createAudioResource(streamResult.stream, {
+                    inputType: streamResult.inputType,
                     inlineVolume: true
                 });
                 if (resource.volume) {
@@ -1260,37 +1485,53 @@ async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<Qu
     console.log(`[Autoplay] Fetching ${count} related songs for: ${lastUrl}`);
     const nextSongs: QueueItem[] = [];
 
-    try {
-        const videoId = extractYouTubeVideoId(lastUrl);
-        if (!videoId) throw new Error('Could not extract video ID from URL');
+    if (!IS_LOW_MEMORY && !lastUrl.includes('soundcloud.com')) {
+        try {
+            const videoId = extractYouTubeVideoId(lastUrl);
+            if (!videoId) throw new Error('Could not extract video ID from URL');
 
-        const mixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-        const data = await fetchYtDlpJson(mixUrl, { flatPlaylist: true });
+            const mixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+            const data = await fetchYtDlpJson(mixUrl, { flatPlaylist: true });
 
-        if (data && data.entries && data.entries.length > 0) {
-            const entries = data.entries.filter((e: any) => e.id !== videoId).slice(0, count);
-            for (const entry of entries) {
-                const song = mapYtDlpEntryToQueueItem(entry, 'AutoPlay 🤖', true);
-                if (song) nextSongs.push(song);
+            if (data && data.entries && data.entries.length > 0) {
+                const entries = data.entries.filter((e: any) => e.id !== videoId).slice(0, count);
+                for (const entry of entries) {
+                    const song = mapYtDlpEntryToQueueItem(entry, 'AutoPlay 🤖', true);
+                    if (song) nextSongs.push(song);
+                }
             }
+        } catch (err) {
+            console.error('[Autoplay] yt-dlp mix fetch failed, trying search fallback:', err);
         }
-    } catch (err) {
-        console.error('[Autoplay] yt-dlp mix fetch failed, trying search fallback:', err);
     }
 
     if (nextSongs.length === 0) {
         try {
-            const searchResults = await play.search('music mix', { limit: count });
-            for (const result of searchResults) {
-                nextSongs.push({
-                    title: result.title || 'AutoPlayed Song',
-                    url: result.url,
-                    requestedBy: 'AutoPlay 🤖',
-                    thumbnail: result.thumbnails?.[0]?.url,
-                    duration: result.durationRaw,
-                    channel: result.channel?.name,
-                    isAutoplay: true
-                });
+            if (IS_LOW_MEMORY || lastUrl.includes('soundcloud.com')) {
+                await ensureSoundCloudClient();
+                const results: any[] = await withTimeout(
+                    play.search('music mix', { limit: count, source: { soundcloud: 'tracks' } }),
+                    8_000,
+                    'play.search(soundcloud autoplay)'
+                );
+                for (const r of results) {
+                    if ((r.durationInSec ?? 0) <= 35) continue;
+                    const item = mapSoundCloudTrack(r, 'AutoPlay 🤖', true);
+                    if (item) nextSongs.push(item);
+                }
+            } else {
+                const searchResults = await play.search('music mix', { limit: count });
+                for (const result of searchResults) {
+                    nextSongs.push({
+                        title: result.title || 'AutoPlayed Song',
+                        url: result.url,
+                        requestedBy: 'AutoPlay 🤖',
+                        thumbnail: result.thumbnails?.[0]?.url,
+                        duration: result.durationRaw,
+                        channel: result.channel?.name,
+                        isAutoplay: true
+                    });
+                }
             }
         } catch (searchErr) {
             console.error('[Autoplay] Fallback search also failed:', searchErr);
