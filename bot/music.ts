@@ -45,6 +45,15 @@ const YT_DLP_BUNDLED_PATH = path.join(
     'bin',
     IS_WINDOWS ? 'yt-dlp.exe' : 'yt-dlp'
 );
+const QJS_BINARY_NAME = IS_WINDOWS
+    ? 'qjs-windows-x86_64.exe'
+    : process.platform === 'darwin'
+    ? 'qjs-darwin'
+    : process.arch === 'arm64'
+    ? 'qjs-linux-aarch64'
+    : 'qjs-linux-x86_64';
+const QJS_BINARY_PATH = path.join(YT_DLP_DIR, IS_WINDOWS ? 'qjs.exe' : 'qjs');
+const QJS_DOWNLOAD_URL = `https://github.com/quickjs-ng/quickjs/releases/latest/download/${QJS_BINARY_NAME}`;
 
 interface YtDlpState {
     binaryPath: string;
@@ -53,13 +62,14 @@ interface YtDlpState {
 }
 
 let ytDlpStatePromise: Promise<YtDlpState> | null = null;
+let quickJsPathPromise: Promise<string | null> | null = null;
 let ytdlAgent: ytdl.Agent | undefined;
 let cookiesFilePath: string | undefined;
 
 function downloadFileWithRedirects(url: string, destPath: string, redirects = 0): Promise<void> {
     return new Promise((resolve, reject) => {
         if (redirects > 5) {
-            return reject(new Error('Too many redirects while downloading yt-dlp'));
+            return reject(new Error(`Too many redirects while downloading ${path.basename(destPath)}`));
         }
 
         const tempPath = `${destPath}.tmp`;
@@ -74,7 +84,7 @@ function downloadFileWithRedirects(url: string, destPath: string, redirects = 0)
 
             if (res.statusCode !== 200) {
                 res.resume();
-                return reject(new Error(`Failed to download yt-dlp: HTTP ${res.statusCode}`));
+                return reject(new Error(`Failed to download ${path.basename(destPath)}: HTTP ${res.statusCode}`));
             }
 
             fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -107,30 +117,34 @@ function downloadFileWithRedirects(url: string, destPath: string, redirects = 0)
     });
 }
 
+async function ensureBinary(label: string, destPath: string, downloadUrl: string, minBytes: number): Promise<void> {
+    const exists = fs.existsSync(destPath);
+    const validSize = exists && fs.statSync(destPath).size > minBytes;
+
+    if (!validSize) {
+        if (exists) fs.unlinkSync(destPath);
+        console.log(`[Setup] Downloading ${label}...`);
+        await downloadFileWithRedirects(downloadUrl, destPath);
+        console.log(`[Setup] ✅ ${label} downloaded and ready.`);
+        return;
+    }
+
+    if (!IS_WINDOWS) {
+        try {
+            fs.chmodSync(destPath, 0o755);
+        } catch {
+            // Ignore chmod errors if already executable
+        }
+    }
+    console.log(`[Setup] ✅ Local ${label} found and ready.`);
+}
+
 function ensureYtDlp(): Promise<YtDlpState> {
     if (ytDlpStatePromise) return ytDlpStatePromise;
 
     ytDlpStatePromise = (async () => {
         try {
-            const exists = fs.existsSync(YT_DLP_BINARY_PATH);
-            const validSize = exists && fs.statSync(YT_DLP_BINARY_PATH).size > 1024 * 1024;
-
-            if (!validSize) {
-                if (exists) fs.unlinkSync(YT_DLP_BINARY_PATH);
-                console.log('[Setup] Downloading latest yt-dlp nightly binary...');
-                await downloadFileWithRedirects(YT_DLP_DOWNLOAD_URL, YT_DLP_BINARY_PATH);
-                console.log('[Setup] ✅ yt-dlp nightly binary downloaded and ready.');
-            } else {
-                if (!IS_WINDOWS) {
-                    try {
-                        fs.chmodSync(YT_DLP_BINARY_PATH, 0o755);
-                    } catch {
-                        // Ignore chmod errors if already executable
-                    }
-                }
-                console.log('[Setup] ✅ Local yt-dlp nightly binary found and ready.');
-            }
-
+            await ensureBinary('yt-dlp nightly binary', YT_DLP_BINARY_PATH, YT_DLP_DOWNLOAD_URL, 1024 * 1024);
             return {
                 binaryPath: YT_DLP_BINARY_PATH,
                 isNightly: true,
@@ -149,8 +163,25 @@ function ensureYtDlp(): Promise<YtDlpState> {
     return ytDlpStatePromise;
 }
 
+function ensureQuickJs(): Promise<string | null> {
+    if (quickJsPathPromise) return quickJsPathPromise;
+
+    quickJsPathPromise = (async () => {
+        try {
+            await ensureBinary('QuickJS runtime', QJS_BINARY_PATH, QJS_DOWNLOAD_URL, 256 * 1024);
+            return QJS_BINARY_PATH;
+        } catch (err) {
+            console.warn('[Setup] ⚠️ QuickJS download failed, falling back to node runtime:', err);
+            return null;
+        }
+    })();
+
+    return quickJsPathPromise;
+}
+
 // Kick off binary checks/downloads at startup without blocking HTTP server boot
 ensureYtDlp().catch((err) => console.error('[Setup] yt-dlp init error:', err));
+ensureQuickJs().catch((err) => console.error('[Setup] QuickJS init error:', err));
 
 let ffmpegInitPromise: Promise<void> | null = null;
 function ensureFfmpeg(): Promise<void> {
@@ -374,7 +405,7 @@ function isYouTubePlaylistUrl(url: string): boolean {
 }
 
 async function fetchYtDlpJson(target: string, extraFlags: Record<string, any> = {}): Promise<any> {
-    const { client, isNightly } = await ensureYtDlp();
+    const [{ client, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
 
     const buildFlags = (useCookies: boolean) => {
         const flags: Record<string, any> = {
@@ -382,12 +413,12 @@ async function fetchYtDlpJson(target: string, extraFlags: Record<string, any> = 
             noWarnings: true,
             forceIpv4: true,
             extractorArgs: useCookies
-                ? 'youtube:player_client=tv,web,mweb'
+                ? 'youtube:player_client=mweb,web'
                 : 'youtube:player_client=android_vr,default,android,ios,tv',
             ...extraFlags
         };
-        if (isNightly) {
-            flags.jsRuntimes = 'node';
+        if (isNightly && useCookies && !extraFlags.flatPlaylist) {
+            flags.jsRuntimes = qjsPath ? `quickjs:${qjsPath}` : 'node';
         }
         if (useCookies && cookiesFilePath) {
             flags.cookies = cookiesFilePath;
@@ -895,27 +926,119 @@ function waitForReadableStream(source: Readable, onCleanup?: () => void, timeout
     });
 }
 
-async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readable> {
-    const { binaryPath, isNightly } = await ensureYtDlp();
-
+function buildYtDlpArgs(
+    url: string,
+    useCookies: boolean,
+    isNightly: boolean,
+    qjsPath: string | null,
+    outputModeArgs: string[]
+): string[] {
     const args = [
-        '-o', '-',
+        ...outputModeArgs,
         '-f', 'bestaudio/best',
         '--no-playlist',
         '--no-progress',
         '--no-warnings',
         '--force-ipv4',
         '--extractor-args',
-        useCookies ? 'youtube:player_client=tv,web,mweb' : 'youtube:player_client=android_vr,ios,android,tv',
+        useCookies ? 'youtube:player_client=mweb,web' : 'youtube:player_client=android_vr,ios,android,tv',
         url
     ];
 
     if (isNightly && useCookies) {
-        args.splice(6, 0, '--js-runtimes', 'node');
+        args.splice(outputModeArgs.length, 0, '--js-runtimes', qjsPath ? `quickjs:${qjsPath}` : 'node');
     }
     if (useCookies && cookiesFilePath) {
         args.unshift('--cookies', cookiesFilePath);
     }
+
+    return args;
+}
+
+/**
+ * Extracts the direct googlevideo audio URL and lets yt-dlp + QuickJS exit before ffmpeg starts,
+ * cutting peak RAM usage on tight 256 MB containers.
+ */
+async function resolveDirectAudioUrl(url: string, useCookies: boolean): Promise<string> {
+    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
+    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-g']);
+
+    const ytDlpProcess = spawn(binaryPath, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+    });
+
+    let stdoutData = '';
+    let errorData = '';
+
+    ytDlpProcess.stdout.on('data', (chunk) => {
+        stdoutData += chunk.toString();
+    });
+    ytDlpProcess.stderr.on('data', (chunk) => {
+        const str = chunk.toString();
+        errorData += str;
+        if (errorData.length > 2000) errorData = errorData.slice(-2000);
+        console.log(`[yt-dlp stderr] ${str.trim()}`);
+    });
+
+    return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            try {
+                ytDlpProcess.kill('SIGTERM');
+            } catch {
+                // Ignore kill errors
+            }
+            reject(new Error(`yt-dlp -g timed out after 55s. Stderr: ${errorData.substring(0, 300)}`));
+        }, 55_000);
+
+        ytDlpProcess.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+
+        ytDlpProcess.on('close', (code) => {
+            clearTimeout(timer);
+            const resolvedUrl = stdoutData
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .find((line) => line.startsWith('http'));
+
+            if (code !== 0 || !resolvedUrl) {
+                return reject(new Error(`yt-dlp -g failed (code ${code}): ${errorData.substring(0, 300)}`));
+            }
+            resolve(resolvedUrl);
+        });
+    });
+}
+
+async function fetchDirectAudioStream(audioUrl: string): Promise<Readable> {
+    if (audioUrl.includes('.m3u8') || audioUrl.includes('manifest.googlevideo.com')) {
+        throw new Error('HLS manifest requires yt-dlp pipe fallback');
+    }
+
+    const controller = new AbortController();
+    const headerTimer = setTimeout(() => controller.abort(), 20_000);
+
+    try {
+        const response = await fetch(audioUrl, { signal: controller.signal });
+        clearTimeout(headerTimer);
+
+        if (!response.ok || !response.body) {
+            throw new Error(`Direct audio fetch returned HTTP ${response.status}`);
+        }
+
+        const webStream = Readable.fromWeb(response.body as any);
+        return await waitForReadableStream(webStream, () => controller.abort(), 20_000);
+    } catch (err) {
+        clearTimeout(headerTimer);
+        controller.abort();
+        throw err;
+    }
+}
+
+async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readable> {
+    const [{ binaryPath, isNightly }, qjsPath] = await Promise.all([ensureYtDlp(), ensureQuickJs()]);
+    const args = buildYtDlpArgs(url, useCookies, isNightly, qjsPath, ['-o', '-']);
 
     const ytDlpProcess = spawn(binaryPath, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -961,7 +1084,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
                 if (!output.destroyed) output.destroy();
                 reject(new Error(`yt-dlp timed out waiting for audio data. Stderr: ${errorData.substring(0, 300)}`));
             }
-        }, 35_000);
+        }, 55_000);
 
         ytDlpProcess.stdout.on('error', () => {});
         ytDlpProcess.stdout.pipe(output);
@@ -1008,10 +1131,20 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
 }
 
 async function getAudioStream(url: string): Promise<{ stream: Readable }> {
-    // Backend 1: yt-dlp with cookies (if configured)
+    // Backend 1: yt-dlp with cookies (QuickJS + direct HTTP streaming keeps peak RAM under 256 MB)
     if (cookiesFilePath) {
         try {
-            console.log('[Stream] Trying yt-dlp WITH cookies...');
+            console.log('[Stream] Resolving audio URL via yt-dlp + QuickJS (WITH cookies)...');
+            const directUrl = await resolveDirectAudioUrl(url, true);
+            const stream = await fetchDirectAudioStream(directUrl);
+            console.log('[Stream] ✅ Direct HTTP audio stream started (yt-dlp + qjs exited)');
+            return { stream };
+        } catch (err: any) {
+            console.log('[Stream] ⚠️ Direct URL stream failed, trying yt-dlp pipe:', err.message?.substring(0, 200));
+        }
+
+        try {
+            console.log('[Stream] Trying yt-dlp pipe WITH cookies...');
             const stream = await runYtDlpStream(url, true);
             console.log('[Stream] ✅ yt-dlp (cookies) stream started');
             return { stream };
