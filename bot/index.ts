@@ -156,9 +156,9 @@ export async function startBot() {
       if (category === 'info') {
         embed.setDescription(`**Categories » Information**\n\n\`\`\`\nHere are the information commands:\n\`\`\`\nℹ️ **Commands Total [ 1 ]**\n\`help\``);
       } else if (category === 'music') {
-        embed.setDescription(`**Categories » Music**\n\n\`\`\`\nHere are the music commands:\n\`\`\`\n🎵 **Commands Total [ 4 ]**\n\`play\` | \`skip\` | \`stop\` | \`list\``);
+        embed.setDescription(`**Categories » Music**\n\n\`\`\`\nHere are the music commands:\n\`\`\`\n🎵 **Commands Total [ 5 ]**\n\`play\` | \`skip\` | \`stop\` | \`list\` | \`seek\``);
       } else if (category === 'ai') {
-        embed.setDescription(`**Categories » AI Chat**\n\n\`\`\`\nHere are the AI commands:\n\`\`\`\n🤖 **Commands Total [ 1 ]**\n\`@${client.user!.username} <message>\``);
+        embed.setDescription(`**Categories » AI Chat**\n\n\`\`\`\nHere are the AI commands:\n\`\`\`\n🤖 **Commands Total [ 2 ]**\n\`/chat <message>\` | \`@${client.user!.username} <message>\``);
       }
 
       await interaction.update({ embeds: [embed] });

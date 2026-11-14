@@ -6,5 +6,10 @@ coverage/
 *.log
 .env
 *-player-script.js
+cookies.txt
+www.youtube.com_cookies.txt
 youtube-cookies.txt
+youtube-cookies-env.txt
 test-cookies.txt
+yt-dlp-nightly-binary*
+.bin/

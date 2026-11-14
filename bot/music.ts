@@ -1,165 +1,266 @@
-import { 
-    joinVoiceChannel, 
-    createAudioPlayer, 
-    createAudioResource, 
-    AudioPlayerStatus, 
-    VoiceConnectionStatus, 
+import {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
     entersState,
-    StreamType 
+    AudioPlayer,
+    VoiceConnection,
+    AudioResource
 } from '@discordjs/voice';
-import { Readable } from 'stream';
+import { Readable, PassThrough } from 'stream';
+import { spawn } from 'child_process';
 import play from 'play-dl';
 import ytDlpExec from 'yt-dlp-exec';
 import ytdl from '@distube/ytdl-core';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
-// autoplay logic is handled inline in getAutoplaySongs below
-import { 
-    Message, 
-    GuildMember, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
+import {
+    GuildMember,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
     ButtonInteraction,
     EmbedBuilder,
     ChatInputCommandInteraction
 } from 'discord.js';
 
+const IS_WINDOWS = process.platform === 'win32';
+const YT_DLP_DIR = path.join(process.cwd(), '.bin');
+const YT_DLP_BINARY_PATH = path.join(YT_DLP_DIR, IS_WINDOWS ? 'yt-dlp.exe' : 'yt-dlp');
+const YT_DLP_DOWNLOAD_URL = IS_WINDOWS
+    ? 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe'
+    : 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
+const YT_DLP_BUNDLED_PATH = path.join(
+    process.cwd(),
+    'node_modules',
+    'yt-dlp-exec',
+    'bin',
+    IS_WINDOWS ? 'yt-dlp.exe' : 'yt-dlp'
+);
+
+interface YtDlpState {
+    binaryPath: string;
+    isNightly: boolean;
+    client: typeof ytDlpExec;
+}
+
+let ytDlpStatePromise: Promise<YtDlpState> | null = null;
 let ytdlAgent: ytdl.Agent | undefined;
-let ytDlp: any;
+let cookiesFilePath: string | undefined;
 
-const YT_DLP_BINARY_PATH = path.join(process.cwd(), 'yt-dlp-nightly-binary');
+function downloadFileWithRedirects(url: string, destPath: string, redirects = 0): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (redirects > 5) {
+            return reject(new Error('Too many redirects while downloading yt-dlp'));
+        }
 
-function downloadYtDlp() {
-    return new Promise<void>((resolve, reject) => {
-        const file = fs.createWriteStream(YT_DLP_BINARY_PATH);
-        
-        const download = (url: string, redirects = 0) => {
-            if (redirects > 5) return reject(new Error('Too many redirects'));
-            https.get(url, (res) => {
-                if (res.statusCode === 301 || res.statusCode === 302) {
-                    download(res.headers.location!, redirects + 1);
-                } else if (res.statusCode === 200) {
-                    res.pipe(file);
-                    file.on('finish', () => {
-                        file.close();
-                        fs.chmodSync(YT_DLP_BINARY_PATH, '755');
+        const tempPath = `${destPath}.tmp`;
+        const req = https.get(url, { headers: { 'User-Agent': 'HelenAI-Bot/1.0' } }, (res) => {
+            if (res.statusCode && [301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+                res.resume();
+                downloadFileWithRedirects(res.headers.location, destPath, redirects + 1)
+                    .then(resolve)
+                    .catch(reject);
+                return;
+            }
+
+            if (res.statusCode !== 200) {
+                res.resume();
+                return reject(new Error(`Failed to download yt-dlp: HTTP ${res.statusCode}`));
+            }
+
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            const file = fs.createWriteStream(tempPath);
+
+            res.pipe(file);
+
+            file.on('finish', () => {
+                file.close(() => {
+                    try {
+                        if (!IS_WINDOWS) {
+                            fs.chmodSync(tempPath, 0o755);
+                        }
+                        fs.renameSync(tempPath, destPath);
                         resolve();
-                    });
-                } else {
-                    reject(new Error(`Failed to download yt-dlp: ${res.statusCode}`));
-                }
-            }).on('error', reject);
-        };
-        
-        // Use nightly builds for better bot bypass
-        const ytDlpUrl = 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
-        console.log("[Setup] Downloading latest yt-dlp nightly binary...");
-        download(ytDlpUrl);
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            });
+
+            file.on('error', (err) => {
+                fs.unlink(tempPath, () => reject(err));
+            });
+        });
+
+        req.on('error', (err) => {
+            fs.unlink(tempPath, () => reject(err));
+        });
     });
 }
 
-// Download latest yt-dlp on startup if missing, or create it directly if found
-let needsDownload = true;
-if (fs.existsSync(YT_DLP_BINARY_PATH)) {
-    const stats = fs.statSync(YT_DLP_BINARY_PATH);
-    if (stats.size > 1024 * 1024) { // > 1MB
-        needsDownload = false;
-    } else {
-        fs.unlinkSync(YT_DLP_BINARY_PATH);
-    }
-}
+function ensureYtDlp(): Promise<YtDlpState> {
+    if (ytDlpStatePromise) return ytDlpStatePromise;
 
-if (needsDownload) {
-    console.log("[Setup] Downloading latest yt-dlp binary...");
-    downloadYtDlp().then(() => {
-        console.log("[Setup] ✅ yt-dlp binary downloaded and ready.");
-    }).catch(err => console.error("[Setup] ❌ Failed to download yt-dlp:", err));
-} else {
-    try {
-        fs.chmodSync(YT_DLP_BINARY_PATH, '755');
-    } catch (e) {}
-    console.log("[Setup] ✅ Local yt-dlp binary found and ready.");
-}
-
-let cookiesFilePath: string | undefined;
-
-cookiesFilePath = undefined;
-
-// First priority: Local file (from user)
-const possiblePaths = [
-    path.join(process.cwd(), 'cookies.txt')
-];
-
-for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-        cookiesFilePath = p;
-        console.log(`[Cookies] ✅ Using local cookies file: ${p}`);
-        
+    ytDlpStatePromise = (async () => {
         try {
-            const cookieFileContent = fs.readFileSync(p, 'utf8');
-            let cookieStr = "";
-            const cookiesArray: any[] = [];
-            
-            for (const line of cookieFileContent.split('\n')) {
-                if (line.startsWith('#') || line.trim() === '') continue;
-                const parts = line.split('\t');
-                if (parts.length >= 7) {
-                    const domain = parts[0];
-                    const pathUrl = parts[2];
-                    const secure = parts[3] === 'TRUE';
-                    const expirationDate = parseInt(parts[4]);
-                    const name = parts[5];
-                    const value = parts[6].trim();
-                    
-                    cookieStr += `${name}=${value}; `;
-                    cookiesArray.push({ name, value, domain, path: pathUrl, secure, expirationDate });
+            const exists = fs.existsSync(YT_DLP_BINARY_PATH);
+            const validSize = exists && fs.statSync(YT_DLP_BINARY_PATH).size > 1024 * 1024;
+
+            if (!validSize) {
+                if (exists) fs.unlinkSync(YT_DLP_BINARY_PATH);
+                console.log('[Setup] Downloading latest yt-dlp nightly binary...');
+                await downloadFileWithRedirects(YT_DLP_DOWNLOAD_URL, YT_DLP_BINARY_PATH);
+                console.log('[Setup] ✅ yt-dlp nightly binary downloaded and ready.');
+            } else {
+                if (!IS_WINDOWS) {
+                    try {
+                        fs.chmodSync(YT_DLP_BINARY_PATH, 0o755);
+                    } catch {
+                        // Ignore chmod errors if already executable
+                    }
                 }
+                console.log('[Setup] ✅ Local yt-dlp nightly binary found and ready.');
             }
-            if (cookieStr) {
-                play.setToken({ youtube: { cookie: cookieStr.trim() } });
-                console.log("[Cookies] ✅ YouTube cookies parsed from file and set for play-dl!");
-            }
-            if (cookiesArray.length > 0) {
-                ytdlAgent = ytdl.createAgent(cookiesArray);
-                console.log("[Cookies] ✅ ytdlAgent created from local cookies file!");
-            }
-        } catch (e) {
-            console.error("Failed to parse local cookies.txt for play-dl and ytdl-core:", e);
+
+            return {
+                binaryPath: YT_DLP_BINARY_PATH,
+                isNightly: true,
+                client: (ytDlpExec as any).create(YT_DLP_BINARY_PATH)
+            };
+        } catch (err) {
+            console.error('[Setup] ⚠️ Nightly yt-dlp download failed, falling back to yt-dlp-exec binary:', err);
+            return {
+                binaryPath: YT_DLP_BUNDLED_PATH,
+                isNightly: false,
+                client: ytDlpExec
+            };
         }
-        break;
-    }
+    })();
+
+    return ytDlpStatePromise;
 }
 
-// Fallback to ENV if file is missing
-if (!cookiesFilePath && process.env.YOUTUBE_COOKIES) {
-    try {
-        const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
-        let netscape = "# Netscape HTTP Cookie File\n";
-        let cookieStr = "";
-        for (const cookie of cookies) {
-            const domain = cookie.domain || '';
-            const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
-            const pathUrl = cookie.path || '/';
-            const secure = cookie.secure ? 'TRUE' : 'FALSE';
-            const expiration = cookie.expirationDate ? Math.round(cookie.expirationDate) : 0;
-            netscape += `${domain}\t${includeSubdomains}\t${pathUrl}\t${secure}\t${expiration}\t${cookie.name}\t${cookie.value}\n`;
-            cookieStr += `${cookie.name}=${cookie.value}; `;
-        }
-        
-        cookiesFilePath = path.join(process.cwd(), 'youtube-cookies-env.txt');
-        fs.writeFileSync(cookiesFilePath, netscape);
-        console.log("[Cookies] ✅ YouTube cookies loaded from ENV!");
+// Kick off binary check/download at startup without blocking HTTP server boot
+ensureYtDlp().catch((err) => console.error('[Setup] yt-dlp init error:', err));
+
+function applyParsedCookies(cookieStr: string, cookiesArray: any[]) {
+    if (cookieStr.trim()) {
         play.setToken({ youtube: { cookie: cookieStr.trim() } });
-    } catch (e) {
-        console.error("Failed to parse YOUTUBE_COOKIES:", e);
+        console.log('[Cookies] ✅ YouTube cookies configured for play-dl.');
+    }
+    if (cookiesArray.length > 0) {
+        ytdlAgent = ytdl.createAgent(cookiesArray);
+        console.log('[Cookies] ✅ ytdlAgent created from YouTube cookies.');
     }
 }
 
-if (!cookiesFilePath) {
-    console.log('[Cookies] ⚠️ No cookies found anywhere. YouTube may block requests.');
+function parseNetscapeCookies(content: string): { cookieStr: string; cookiesArray: any[] } {
+    let cookieStr = '';
+    const cookiesArray: any[] = [];
+
+    for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const parts = line.split('\t');
+        if (parts.length < 7) continue;
+
+        const domain = parts[0];
+        const pathUrl = parts[2] || '/';
+        const secure = parts[3] === 'TRUE';
+        const parsedExp = Number.parseInt(parts[4], 10);
+        const expirationDate = Number.isFinite(parsedExp) ? parsedExp : undefined;
+        const name = parts[5];
+        const value = parts.slice(6).join('\t').trim();
+
+        if (!name) continue;
+        cookieStr += `${name}=${value}; `;
+        cookiesArray.push({ name, value, domain, path: pathUrl, secure, expirationDate });
+    }
+
+    return { cookieStr, cookiesArray };
 }
+
+function initializeCookies() {
+    // 1. Prioritize YOUTUBE_COOKIES env var (Render / cloud deployments)
+    const envCookies = process.env.YOUTUBE_COOKIES?.trim();
+    if (envCookies) {
+        const envCookiePath = path.join(process.cwd(), 'youtube-cookies-env.txt');
+        try {
+            if (envCookies.startsWith('[') || envCookies.startsWith('{')) {
+                const parsed = JSON.parse(envCookies);
+                const cookieList = Array.isArray(parsed) ? parsed : [parsed];
+                let netscape = '# Netscape HTTP Cookie File\n';
+                let cookieStr = '';
+                const cookiesArray: any[] = [];
+
+                for (const cookie of cookieList) {
+                    if (!cookie?.name) continue;
+                    const domain = cookie.domain || '.youtube.com';
+                    const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+                    const pathUrl = cookie.path || '/';
+                    const secure = cookie.secure ? 'TRUE' : 'FALSE';
+                    const expiration = cookie.expirationDate ? Math.round(cookie.expirationDate) : 0;
+                    const value = String(cookie.value ?? '');
+
+                    netscape += `${domain}\t${includeSubdomains}\t${pathUrl}\t${secure}\t${expiration}\t${cookie.name}\t${value}\n`;
+                    cookieStr += `${cookie.name}=${value}; `;
+                    cookiesArray.push({
+                        name: cookie.name,
+                        value,
+                        domain,
+                        path: pathUrl,
+                        secure: Boolean(cookie.secure),
+                        expirationDate: expiration || undefined
+                    });
+                }
+
+                fs.writeFileSync(envCookiePath, netscape, 'utf8');
+                cookiesFilePath = envCookiePath;
+                console.log('[Cookies] ✅ YouTube cookies loaded from YOUTUBE_COOKIES (JSON).');
+                applyParsedCookies(cookieStr, cookiesArray);
+                return;
+            }
+
+            // Also support raw Netscape cookies.txt text pasted into YOUTUBE_COOKIES
+            fs.writeFileSync(envCookiePath, envCookies, 'utf8');
+            cookiesFilePath = envCookiePath;
+            const { cookieStr, cookiesArray } = parseNetscapeCookies(envCookies);
+            console.log('[Cookies] ✅ YouTube cookies loaded from YOUTUBE_COOKIES (Netscape).');
+            applyParsedCookies(cookieStr, cookiesArray);
+            return;
+        } catch (err) {
+            console.error('[Cookies] ❌ Failed to parse YOUTUBE_COOKIES env var:', err);
+        }
+    }
+
+    // 2. Fallback to local cookies.txt for local development
+    const localCookieCandidates = [
+        path.join(process.cwd(), 'cookies.txt'),
+        path.join(process.cwd(), 'youtube-cookies.txt')
+    ];
+
+    for (const candidate of localCookieCandidates) {
+        if (!fs.existsSync(candidate)) continue;
+        cookiesFilePath = candidate;
+        console.log(`[Cookies] ✅ Using local cookies file: ${candidate}`);
+        try {
+            const content = fs.readFileSync(candidate, 'utf8');
+            const { cookieStr, cookiesArray } = parseNetscapeCookies(content);
+            applyParsedCookies(cookieStr, cookiesArray);
+        } catch (err) {
+            console.error('[Cookies] ❌ Failed to parse local cookies file:', err);
+        }
+        return;
+    }
+
+    console.log('[Cookies] ⚠️ No cookies configured. YouTube may rate-limit or block datacenter IPs.');
+}
+
+initializeCookies();
 
 interface QueueItem {
     title: string;
@@ -174,26 +275,204 @@ interface QueueItem {
 interface ServerQueue {
     voiceChannelId: string;
     textChannelId: string;
-    connection: any;
-    player: any;
+    connection: VoiceConnection;
+    player: AudioPlayer;
     songs: QueueItem[];
     history: QueueItem[];
     playing: boolean;
     autoplay: boolean;
     loop: boolean;
     volume: number;
-    audioResource: any;
+    audioResource: AudioResource | null;
     lastPlayedUrl?: string;
     isGoingBack?: boolean;
     isFetchingAutoplay?: boolean;
+    lastSongErrored?: boolean;
+    isStartingTrack?: boolean;
     leaveTimeout?: NodeJS.Timeout;
 }
 
 const queue = new Map<string, ServerQueue>();
 
+function formatDurationSeconds(seconds?: number): string {
+    if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return '0:00';
+    const hrs = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    if (hrs > 0) {
+        return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+    return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
+function extractYouTubeVideoId(url: string): string | null {
+    const match = url.match(/(?:youtube\.com\/(?:watch\?.*v=|shorts\/|embed\/|live\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    return match?.[1] ?? null;
+}
+
+function isYouTubePlaylistUrl(url: string): boolean {
+    if (url.includes('playlist?list=')) return true;
+    return url.includes('list=') && !extractYouTubeVideoId(url);
+}
+
+async function fetchYtDlpJson(target: string, extraFlags: Record<string, any> = {}): Promise<any> {
+    const { client, isNightly } = await ensureYtDlp();
+
+    const buildFlags = (useCookies: boolean) => {
+        const flags: Record<string, any> = {
+            dumpSingleJson: true,
+            noWarnings: true,
+            forceIpv4: true,
+            extractorArgs: useCookies
+                ? 'youtube:player_client=tv,web,mweb'
+                : 'youtube:player_client=default,android,ios,tv',
+            ...extraFlags
+        };
+        if (isNightly) {
+            flags.jsRuntimes = 'node';
+        }
+        if (useCookies && cookiesFilePath) {
+            flags.cookies = cookiesFilePath;
+        }
+        return flags;
+    };
+
+    if (cookiesFilePath) {
+        try {
+            return await (client as any)(target, buildFlags(true));
+        } catch (err) {
+            console.warn('[yt-dlp JSON] Cookie attempt failed, retrying without cookies:', (err as any)?.message?.substring(0, 150));
+        }
+    }
+
+    return await (client as any)(target, buildFlags(false));
+}
+
+function mapYtDlpEntryToQueueItem(entry: any, requestedBy: string, isAutoplay = false): QueueItem | null {
+    const videoUrl = entry?.webpage_url
+        || (typeof entry?.url === 'string' && entry.url.startsWith('http') ? entry.url : null)
+        || (entry?.id ? `https://www.youtube.com/watch?v=${entry.id}` : null);
+
+    if (!videoUrl) return null;
+    if (entry?.title === '[Private video]' || entry?.title === '[Deleted video]') return null;
+
+    const thumbnails = Array.isArray(entry?.thumbnails) ? entry.thumbnails : [];
+    const thumbnail = entry?.thumbnail || thumbnails[thumbnails.length - 1]?.url || thumbnails[0]?.url;
+
+    return {
+        title: entry?.title || 'Unknown Title',
+        url: videoUrl,
+        requestedBy,
+        thumbnail,
+        duration: entry?.duration ? formatDurationSeconds(entry.duration) : 'Unknown',
+        channel: entry?.uploader || entry?.channel || 'Unknown',
+        isAutoplay
+    };
+}
+
+async function searchYouTubeTrack(searchStr: string, requestedBy: string): Promise<QueueItem | null> {
+    // 1. Try play-dl search
+    try {
+        const searchResults = await play.search(searchStr, { limit: 1 });
+        if (searchResults && searchResults.length > 0) {
+            const first = searchResults[0];
+            return {
+                title: first.title || 'Unknown Title',
+                url: first.url,
+                requestedBy,
+                thumbnail: first.thumbnails[0]?.url,
+                duration: first.durationRaw,
+                channel: first.channel?.name,
+                isAutoplay: false
+            };
+        }
+    } catch (err) {
+        console.warn('[Search] play-dl search failed, falling back to yt-dlp:', (err as any)?.message?.substring(0, 120));
+    }
+
+    // 2. Fallback to yt-dlp ytsearch1
+    try {
+        const data = await fetchYtDlpJson(`ytsearch1:${searchStr}`, { flatPlaylist: true });
+        const entry = data?.entries?.[0] ?? data;
+        return mapYtDlpEntryToQueueItem(entry, requestedBy, false);
+    } catch (err) {
+        console.error('[Search] yt-dlp search also failed:', (err as any)?.message?.substring(0, 200));
+        return null;
+    }
+}
+
+function destroyQueue(guildId: string) {
+    const serverQueue = queue.get(guildId);
+    if (!serverQueue) return;
+
+    if (serverQueue.leaveTimeout) {
+        clearTimeout(serverQueue.leaveTimeout);
+        serverQueue.leaveTimeout = undefined;
+    }
+    serverQueue.songs = [];
+    queue.delete(guildId);
+
+    try {
+        serverQueue.player.stop(true);
+    } catch {
+        // Ignore stop errors during cleanup
+    }
+    try {
+        serverQueue.connection.destroy();
+    } catch {
+        // Ignore destroy errors if already destroyed
+    }
+}
+
+function advanceAndPlayNext(guildId: string) {
+    const serverQueue = queue.get(guildId);
+    if (!serverQueue) return;
+
+    if (serverQueue.isGoingBack) {
+        serverQueue.isGoingBack = false;
+        const previousSong = serverQueue.history.pop();
+        if (previousSong) {
+            serverQueue.songs.unshift(previousSong);
+        }
+    } else {
+        const finishedSong = serverQueue.songs.shift();
+        if (finishedSong) {
+            if (serverQueue.loop && !serverQueue.lastSongErrored) {
+                serverQueue.songs.unshift(finishedSong);
+            } else {
+                serverQueue.history.push(finishedSong);
+                if (serverQueue.history.length > 50) serverQueue.history.shift();
+            }
+        }
+    }
+
+    serverQueue.lastSongErrored = false;
+    void playNextSong(guildId);
+}
+
+function setupQueueEvents(guildId: string, serverQueue: ServerQueue) {
+    serverQueue.player.on(AudioPlayerStatus.Idle, () => {
+        if (!queue.has(guildId)) return;
+        advanceAndPlayNext(guildId);
+    });
+
+    serverQueue.player.on('error', (error: any) => {
+        console.error('Audio Player Error:', error);
+        const currentQueue = queue.get(guildId);
+        if (!currentQueue) return;
+
+        currentQueue.lastSongErrored = true;
+        // AudioPlayer automatically transitions to Idle after emitting 'error' while Playing/Buffering.
+        // Only advance manually if the player was already Idle.
+        if (currentQueue.player.state.status === AudioPlayerStatus.Idle) {
+            advanceAndPlayNext(guildId);
+        }
+    });
+}
+
 export async function handleMusicCommand(interaction: ChatInputCommandInteraction): Promise<boolean> {
     if (!interaction.guild) return false;
-    
+
     const command = interaction.commandName;
     const serverQueue = queue.get(interaction.guild.id);
 
@@ -203,7 +482,7 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
         await executePlay(interaction, serverQueue, query);
         return true;
     } else if (command === 'skip') {
-        if (!serverQueue) {
+        if (!serverQueue || serverQueue.songs.length === 0) {
             await interaction.reply("There is no song playing that I could skip!");
             return true;
         }
@@ -215,10 +494,7 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
             await interaction.reply("There is no song that I could stop!");
             return true;
         }
-        serverQueue.songs = [];
-        serverQueue.player.stop();
-        serverQueue.connection.destroy();
-        queue.delete(interaction.guild.id);
+        destroyQueue(interaction.guild.id);
         await interaction.reply("🛑 Stopped playing and left the channel.");
         return true;
     } else if (command === 'list') {
@@ -226,10 +502,10 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
             await interaction.reply({ content: "The queue is currently empty!", ephemeral: true });
             return true;
         }
-        
+
         const embed = getQueueEmbed(serverQueue, 0);
         const row = getQueuePaginationRow(0, serverQueue.songs.length);
-        
+
         await interaction.reply({ embeds: [embed], components: [row] });
         return true;
     } else if (command === 'seek') {
@@ -237,33 +513,33 @@ export async function handleMusicCommand(interaction: ChatInputCommandInteractio
             await interaction.reply("There is no song playing right now!");
             return true;
         }
-        
+
         const currentSong = serverQueue.songs[0];
-        
+
         const embed = new EmbedBuilder()
             .setColor('#2b2d31')
             .setAuthor({ name: 'MUSIC PANEL' })
             .setDescription(`💿 [${currentSong.title}](${currentSong.url})\n\n👤 **Requested By**\n\`@${currentSong.requestedBy}\`\n\n⏱️ **Music Duration**\n\`${currentSong.duration || 'Unknown'}\`\n\n🎤 **Music Author**\n\`${currentSong.channel || 'Unknown'}\``);
-        
+
         if (currentSong.thumbnail) {
             embed.setThumbnail(currentSong.thumbnail);
         }
-        
+
         const rows = getDashboardRows(serverQueue);
-        await interaction.reply({ 
-            embeds: [embed], 
-            components: rows 
+        await interaction.reply({
+            embeds: [embed],
+            components: rows
         });
         return true;
     }
-    
+
     return false;
 }
 
 async function executePlay(interaction: ChatInputCommandInteraction, serverQueue: ServerQueue | undefined, query: string) {
     const member = interaction.member as GuildMember;
     const voiceChannel = member.voice.channel;
-    
+
     if (!voiceChannel) {
         return interaction.editReply("You need to be in a voice channel to play music!");
     }
@@ -276,7 +552,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 try {
                     await interaction.editReply("🎵 Loading from Spotify... This might take a moment as I search for the tracks.");
                     const sp_data = await play.spotify(query);
-                    
+
                     let tracksToSearch: string[] = [];
                     if (sp_data.type === 'track') {
                         const track = sp_data as any;
@@ -299,84 +575,65 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     }
 
                     for (const searchStr of tracksToSearch) {
-                        try {
-                            const searchResults = await play.search(searchStr, { limit: 1 });
-                            if (searchResults && searchResults.length > 0) {
-                                songsToAdd.push({
-                                    title: searchResults[0].title || "Unknown Title",
-                                    url: searchResults[0].url,
-                                    requestedBy: interaction.user.username,
-                                    thumbnail: searchResults[0].thumbnails[0]?.url,
-                                    duration: searchResults[0].durationRaw,
-                                    channel: searchResults[0].channel?.name,
-                                    isAutoplay: false
-                                });
-                            }
-                        } catch(e) {
-                            console.error("Failed to search track from spotify:", searchStr);
-                        }
+                        const song = await searchYouTubeTrack(searchStr, interaction.user.username);
+                        if (song) songsToAdd.push(song);
                     }
                 } catch (err) {
                     console.error("Spotify error:", err);
                     return interaction.editReply("Sorry, I had trouble reading that Spotify link. Make sure it's valid or try another one!");
                 }
-            } else if (query.includes('playlist?list=')) {
+            } else if (isYouTubePlaylistUrl(query)) {
                 try {
                     await interaction.editReply("⏳ Loading playlist... This might take a moment.");
-                    const data: any = await (ytDlp as any)(query, {
-                        dumpSingleJson: true,
-                        flatPlaylist: true,
-                        'extractor-args': 'youtube:player_client=default,android,ios,web'
-                    });
-                    
+                    const data = await fetchYtDlpJson(query, { flatPlaylist: true });
+
                     if (!data || !data.entries || data.entries.length === 0) {
                         return interaction.editReply("I couldn't find any songs in that playlist.");
                     }
-                    
+
                     for (const entry of data.entries) {
-                        if (!entry.url) continue;
-                        songsToAdd.push({
-                            title: entry.title || "Unknown Title",
-                            url: entry.url,
-                            requestedBy: interaction.user.username,
-                            thumbnail: entry.thumbnails?.[0]?.url,
-                            duration: entry.duration ? String(Math.floor(entry.duration / 60)) + ":" + String(Math.floor(entry.duration % 60)).padStart(2, '0') : "0:00",
-                            channel: entry.uploader || entry.channel
-                        });
+                        const song = mapYtDlpEntryToQueueItem(entry, interaction.user.username, false);
+                        if (song) songsToAdd.push(song);
                     }
                 } catch (err) {
                     console.error("Playlist error:", err);
                     return interaction.editReply("There was an error loading the playlist.");
                 }
             } else {
+                // Single URL: try play-dl first, then fall back to yt-dlp metadata
+                let loaded = false;
                 try {
                     const data = await play.video_info(query);
                     songsToAdd.push({
-                        title: data.video_details.title,
+                        title: data.video_details.title || 'Unknown Title',
                         url: data.video_details.url,
                         requestedBy: interaction.user.username,
                         thumbnail: data.video_details.thumbnails[0]?.url,
                         duration: data.video_details.durationRaw,
                         channel: data.video_details.channel?.name
                     });
+                    loaded = true;
                 } catch (err) {
-                    return interaction.editReply("Sorry, I couldn't load that YouTube video.");
+                    console.warn("[URL] play.video_info failed, trying yt-dlp fallback:", (err as any)?.message?.substring(0, 120));
+                }
+
+                if (!loaded) {
+                    try {
+                        const data = await fetchYtDlpJson(query, { noPlaylist: true });
+                        const song = mapYtDlpEntryToQueueItem(data, interaction.user.username, false);
+                        if (song) songsToAdd.push(song);
+                    } catch (err) {
+                        console.error("[URL] yt-dlp metadata fallback failed:", err);
+                        return interaction.editReply("Sorry, I couldn't load that video URL.");
+                    }
                 }
             }
         } else {
-            const searchResults = await play.search(query, { limit: 1 });
-            if (!searchResults || searchResults.length === 0) {
+            const song = await searchYouTubeTrack(query, interaction.user.username);
+            if (!song) {
                 return interaction.editReply("I couldn't find any results for that search.");
             }
-            songsToAdd.push({
-                title: searchResults[0].title,
-                url: searchResults[0].url,
-                requestedBy: interaction.user.username,
-                thumbnail: searchResults[0].thumbnails[0]?.url,
-                duration: searchResults[0].durationRaw,
-                channel: searchResults[0].channel?.name,
-                isAutoplay: false
-            });
+            songsToAdd.push(song);
         }
 
         if (songsToAdd.length === 0) {
@@ -385,13 +642,17 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
 
         const firstSong = songsToAdd[0];
 
-
-
         if (!serverQueue) {
+            const connection = joinVoiceChannel({
+                channelId: voiceChannel.id,
+                guildId: interaction.guild!.id,
+                adapterCreator: interaction.guild!.voiceAdapterCreator as any
+            });
+
             const queueConstruct: ServerQueue = {
                 textChannelId: interaction.channelId,
                 voiceChannelId: voiceChannel.id,
-                connection: null,
+                connection,
                 player: createAudioPlayer(),
                 songs: [],
                 history: [],
@@ -402,63 +663,61 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 audioResource: null
             };
 
+            setupQueueEvents(interaction.guild!.id, queueConstruct);
             queue.set(interaction.guild!.id, queueConstruct);
             queueConstruct.songs.push(...songsToAdd);
 
             try {
-                const connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: interaction.guild!.id,
-                    adapterCreator: interaction.guild!.voiceAdapterCreator as any
+                connection.on('error', (err) => {
+                    console.error('[VoiceConnection Error]', err);
                 });
 
-                queueConstruct.connection = connection;
-                
-                connection.on(VoiceConnectionStatus.Disconnected, async (oldState, newState) => {
+                connection.on(VoiceConnectionStatus.Disconnected, async () => {
                     try {
                         await Promise.race([
-                            entersState(connection, VoiceConnectionStatus.Signalling, 20_000),
-                            entersState(connection, VoiceConnectionStatus.Connecting, 20_000),
+                            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
                         ]);
-                    } catch (error) {
-                        connection.destroy();
-                        queue.delete(interaction.guild!.id);
+                    } catch {
+                        destroyQueue(interaction.guild!.id);
                     }
                 });
 
                 connection.subscribe(queueConstruct.player);
                 await playNextSong(interaction.guild!.id);
-                
+
+                if (queueConstruct.songs.length === 0) {
+                    return interaction.editReply("❌ Failed to play the requested track. YouTube may be blocking the stream right now.");
+                }
+
                 const embed = new EmbedBuilder()
                     .setColor('#2b2d31')
                     .setAuthor({ name: 'MUSIC PANEL' })
                     .setDescription(`💿 [${firstSong.title}](${firstSong.url})\n\n👤 **Requested By**\n\`@${firstSong.requestedBy}\`\n\n⏱️ **Music Duration**\n\`${firstSong.duration || 'Unknown'}\`\n\n🎤 **Music Author**\n\`${firstSong.channel || 'Unknown'}\``);
-                
+
                 if (firstSong.thumbnail) {
                     embed.setThumbnail(firstSong.thumbnail);
                 }
-                
+
                 if (songsToAdd.length > 1) {
                     embed.setFooter({ text: `Added ${songsToAdd.length} songs to the queue from playlist!` });
                 }
 
                 const rows = getDashboardRows(queueConstruct);
-                interaction.editReply({ 
-                    embeds: [embed], 
-                    components: rows 
+                await interaction.editReply({
+                    embeds: [embed],
+                    components: rows
                 });
-                
-                // If autoplay is on, fetch the next song
+
                 if (queueConstruct.autoplay) {
                     checkAndFetchAutoplay(queueConstruct);
                 }
             } catch (err) {
                 console.error(err);
-                queue.delete(interaction.guild!.id);
+                destroyQueue(interaction.guild!.id);
                 return interaction.editReply("There was an error connecting to the voice channel!");
             }
         } else {
-            // Remove any upcoming autoplay songs from the queue (keep the currently playing song at index 0 even if it's autoplay)
             if (serverQueue.autoplay && serverQueue.songs.length > 1) {
                 const currentSong = serverQueue.songs[0];
                 serverQueue.songs = [currentSong, ...serverQueue.songs.slice(1).filter(s => !s.isAutoplay)];
@@ -466,16 +725,15 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
 
             const wasEmpty = serverQueue.songs.length === 0;
             serverQueue.songs.push(...songsToAdd);
-            
+
             if (wasEmpty) {
                 if (serverQueue.leaveTimeout) {
                     clearTimeout(serverQueue.leaveTimeout);
                     serverQueue.leaveTimeout = undefined;
                 }
-                playNextSong(interaction.guild!.id);
+                await playNextSong(interaction.guild!.id);
             }
 
-            // Re-trigger autoplay fetch based on the newly added songs
             if (serverQueue.autoplay) {
                 checkAndFetchAutoplay(serverQueue);
             }
@@ -492,95 +750,205 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
     }
 }
 
-async function getAudioStream(url: string, title?: string): Promise<{ stream: string | Readable }> {
-    // Backend 1: Try yt-dlp (URL extraction)
-    try {
-        console.log('[Stream] Trying yt-dlp...');
-        const ytDlpArgs = [
-            '-o', '-',
-            '-f', 'bestaudio',
-            '--no-warnings',
-            '--force-ipv4',
-            '--js-runtimes', 'node',
-            '--extractor-args', 'youtube:player_client=ios,android,tv',
-            url
-        ];
+function waitForReadableStream(source: Readable, onCleanup?: () => void, timeoutMs = 20_000): Promise<Readable> {
+    return new Promise((resolve, reject) => {
+        const output = new PassThrough({ highWaterMark: 1 << 20 });
+        let settled = false;
 
-        const { spawn } = await import('child_process');
-
-        const runYtDlp = async (useCookies: boolean) => {
-            const currentArgs = [...ytDlpArgs];
-            if (useCookies && cookiesFilePath) {
-                currentArgs.unshift('--cookies', cookiesFilePath);
+        const timer = setTimeout(() => {
+            if (!settled) {
+                settled = true;
+                cleanupSource();
+                reject(new Error(`Timed out waiting for audio stream (${timeoutMs}ms)`));
             }
-            
-            const ytDlpProcess = spawn(YT_DLP_BINARY_PATH, currentArgs);
-            
-            return new Promise<Readable>((resolve, reject) => {
-                let errorData = '';
-                
-                ytDlpProcess.stdout.once('data', (chunk) => {
-                    ytDlpProcess.stdout.unshift(chunk); // Crucial: put the chunk back so ffmpeg can read the file header!
-                    resolve(ytDlpProcess.stdout);
-                });
-                
-                ytDlpProcess.stderr.on('data', (data) => {
-                    const str = data.toString();
-                    errorData += str;
-                    console.log(`[yt-dlp stderr] ${str.trim()}`);
-                });
-                
-                ytDlpProcess.on('error', reject);
-                
-                ytDlpProcess.on('close', (code) => {
-                    if (code !== 0) {
-                        reject(new Error(`yt-dlp exited with code ${code}. Stderr: ${errorData.substring(0, 300)}`));
-                    } else if (errorData) {
-                        // Sometimes it exits 0 but fails to download or writes 0 bytes
-                        reject(new Error(`yt-dlp exited with code 0 but no data. Stderr: ${errorData.substring(0, 300)}`));
-                    }
-                });
-            });
+        }, timeoutMs);
+
+        const cleanupSource = () => {
+            clearTimeout(timer);
+            source.unpipe(output);
+            if (!source.destroyed) source.destroy();
+            if (!output.destroyed) output.destroy();
+            onCleanup?.();
         };
 
-        let stream: Readable;
-        try {
-            console.log('[Stream] Trying yt-dlp WITH cookies...');
-            stream = await runYtDlp(true);
-        } catch (err: any) {
-            console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
-            console.log('[Stream] Trying yt-dlp WITHOUT cookies as fallback...');
-            stream = await runYtDlp(false);
-        }
+        source.pipe(output);
 
-        console.log('[Stream] ✅ yt-dlp stream generated successfully');
-        return { stream }; 
-    } catch (err: any) {
-        console.log('[Stream] ❌ yt-dlp failed:', err.message?.substring(0, 500));
+        output.once('readable', () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(output);
+        });
+
+        output.on('close', () => {
+            onCleanup?.();
+        });
+
+        source.on('error', (err) => {
+            if (!settled) {
+                settled = true;
+                cleanupSource();
+                reject(err);
+            } else if (!output.destroyed) {
+                output.destroy(err);
+            }
+        });
+
+        source.once('end', () => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error('Stream ended before producing any audio data'));
+            }
+        });
+    });
+}
+
+async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readable> {
+    const { binaryPath, isNightly } = await ensureYtDlp();
+
+    const args = [
+        '-o', '-',
+        '-f', 'bestaudio/best',
+        '--no-playlist',
+        '--no-progress',
+        '--no-warnings',
+        '--force-ipv4',
+        '--extractor-args',
+        useCookies ? 'youtube:player_client=tv,web,mweb' : 'youtube:player_client=ios,android,tv',
+        url
+    ];
+
+    if (isNightly) {
+        args.splice(6, 0, '--js-runtimes', 'node');
+    }
+    if (useCookies && cookiesFilePath) {
+        args.unshift('--cookies', cookiesFilePath);
     }
 
-    // Backend 2: Try play-dl
+    const ytDlpProcess = spawn(binaryPath, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+    });
+
+    let errorData = '';
+    ytDlpProcess.stderr.on('data', (data) => {
+        const str = data.toString();
+        errorData += str;
+        if (errorData.length > 2000) {
+            errorData = errorData.slice(-2000);
+        }
+        console.log(`[yt-dlp stderr] ${str.trim()}`);
+    });
+
+    const killProcess = () => {
+        if (!ytDlpProcess.killed) {
+            try {
+                ytDlpProcess.kill('SIGTERM');
+            } catch {
+                // Ignore kill errors
+            }
+        }
+    };
+
+    return new Promise<Readable>((resolve, reject) => {
+        const output = new PassThrough({ highWaterMark: 1 << 20 });
+        let settled = false;
+
+        const timer = setTimeout(() => {
+            if (!settled) {
+                settled = true;
+                killProcess();
+                if (!output.destroyed) output.destroy();
+                reject(new Error(`yt-dlp timed out waiting for audio data. Stderr: ${errorData.substring(0, 300)}`));
+            }
+        }, 25_000);
+
+        ytDlpProcess.stdout.on('error', () => {});
+        ytDlpProcess.stdout.pipe(output);
+
+        output.once('readable', () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(output);
+        });
+
+        output.on('close', () => {
+            killProcess();
+        });
+
+        ytDlpProcess.on('error', (err) => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                if (!output.destroyed) output.destroy();
+                reject(err);
+            } else if (!output.destroyed) {
+                output.destroy(err);
+            }
+        });
+
+        ytDlpProcess.on('close', (code) => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                if (!output.destroyed) output.destroy();
+                reject(new Error(`yt-dlp exited with code ${code} before producing audio. Stderr: ${errorData.substring(0, 300)}`));
+            } else if (code !== 0 && !output.destroyed) {
+                console.warn(`[yt-dlp] Exited mid-stream with code ${code}`);
+            }
+        });
+    });
+}
+
+async function getAudioStream(url: string): Promise<{ stream: Readable }> {
+    // Backend 1: yt-dlp with cookies (if configured)
+    if (cookiesFilePath) {
+        try {
+            console.log('[Stream] Trying yt-dlp WITH cookies...');
+            const stream = await runYtDlpStream(url, true);
+            console.log('[Stream] ✅ yt-dlp (cookies) stream started');
+            return { stream };
+        } catch (err: any) {
+            console.log('[Stream] ❌ yt-dlp WITH cookies failed:', err.message?.substring(0, 200));
+        }
+    }
+
+    // Backend 2: yt-dlp without cookies (anonymous mobile/TV clients)
+    try {
+        console.log('[Stream] Trying yt-dlp WITHOUT cookies...');
+        const stream = await runYtDlpStream(url, false);
+        console.log('[Stream] ✅ yt-dlp (anonymous) stream started');
+        return { stream };
+    } catch (err: any) {
+        console.log('[Stream] ❌ yt-dlp WITHOUT cookies failed:', err.message?.substring(0, 200));
+    }
+
+    // Backend 3: play-dl
     try {
         console.log('[Stream] Trying play-dl...');
         const playStream = await play.stream(url);
+        const stream = await waitForReadableStream(playStream.stream as unknown as Readable);
         console.log('[Stream] ✅ play-dl stream started successfully');
-        return { stream: playStream.stream as unknown as Readable };
+        return { stream };
     } catch (err: any) {
-        console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 100));
+        console.log('[Stream] ❌ play-dl failed:', err.message?.substring(0, 150));
     }
-    
-    // Backend 3: Try ytdl-core
+
+    // Backend 4: ytdl-core
     try {
         console.log('[Stream] Trying ytdl-core...');
-        const stream = ytdl(url, {
+        const rawStream = ytdl(url, {
             filter: 'audioonly',
             highWaterMark: 1 << 25,
             agent: ytdlAgent
         });
+        const stream = await waitForReadableStream(rawStream);
         console.log('[Stream] ✅ ytdl-core stream started successfully');
         return { stream };
     } catch (err: any) {
-        console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 100));
+        console.log('[Stream] ❌ ytdl-core failed:', err.message?.substring(0, 150));
     }
 
     throw new Error('All YouTube extractors failed to bypass bot protection.');
@@ -588,85 +956,64 @@ async function getAudioStream(url: string, title?: string): Promise<{ stream: st
 
 async function playNextSong(guildId: string) {
     const serverQueue = queue.get(guildId);
-    if (!serverQueue) return;
+    if (!serverQueue || serverQueue.isStartingTrack) return;
 
-    if (serverQueue.songs.length === 0) {
-        if (serverQueue.autoplay && serverQueue.lastPlayedUrl) {
-            try {
-                // If queue is completely empty but autoplay is on, fetch next batch
-                const nextSongs = await getAutoplaySongs(serverQueue.lastPlayedUrl, 10);
-                serverQueue.songs.push(...nextSongs);
-            } catch (err) {
-                console.error("Autoplay failed:", err);
-                serverQueue.connection.destroy();
-                queue.delete(guildId);
-                return;
-            }
-        } else {
-            // Wait 60 seconds before leaving
-            if (serverQueue.leaveTimeout) clearTimeout(serverQueue.leaveTimeout);
-            serverQueue.leaveTimeout = setTimeout(() => {
-                const currentQueue = queue.get(guildId);
-                if (currentQueue && currentQueue.songs.length === 0) {
-                    currentQueue.connection.destroy();
-                    queue.delete(guildId);
-                }
-            }, 60_000);
-            return;
-        }
-    }
-
-    const song = serverQueue.songs[0];
-    serverQueue.lastPlayedUrl = song.url;
-    
+    serverQueue.isStartingTrack = true;
     try {
-        // Try multiple streaming backends with automatic fallback
-        const streamResult = await getAudioStream(song.url, song.title);
-        
-        const resource = createAudioResource(streamResult.stream, { 
-            inlineVolume: true
-        });
-        if (resource.volume) {
-            resource.volume.setVolume(serverQueue.volume);
-        }
-        serverQueue.audioResource = resource;
-
-        serverQueue.player.play(resource);
-        
-        // Asynchronously pre-fetch next song if autoplay is on
-        checkAndFetchAutoplay(serverQueue);
-
-        // We use once so it only triggers for THIS specific song playing
-        serverQueue.player.once(AudioPlayerStatus.Idle, () => {
-            if (serverQueue.isGoingBack) {
-                serverQueue.isGoingBack = false;
-                const previousSong = serverQueue.history.pop();
-                if (previousSong) {
-                    serverQueue.songs.unshift(previousSong);
-                }
-            } else {
-                const finishedSong = serverQueue.songs.shift(); // Remove the finished song
-                if (finishedSong) {
-                    if (serverQueue.loop) {
-                        serverQueue.songs.unshift(finishedSong); // Put it back at the front for single-song loop
-                    } else {
-                        serverQueue.history.push(finishedSong);
-                        if (serverQueue.history.length > 50) serverQueue.history.shift();
-                    }
+        while (serverQueue.songs.length > 0 || (serverQueue.autoplay && serverQueue.lastPlayedUrl)) {
+            if (serverQueue.songs.length === 0) {
+                try {
+                    const nextSongs = await getAutoplaySongs(serverQueue.lastPlayedUrl!, 10);
+                    if (nextSongs.length === 0) break;
+                    serverQueue.songs.push(...nextSongs);
+                } catch (err) {
+                    console.error("Autoplay failed:", err);
+                    destroyQueue(guildId);
+                    return;
                 }
             }
-            playNextSong(guildId);
-        });
 
-        serverQueue.player.once('error', (error: any) => {
-            console.error('Audio Player Error:', error);
-            serverQueue.songs.shift();
-            playNextSong(guildId);
-        });
-    } catch (error) {
-        console.error("Error playing next song:", error);
-        serverQueue.songs.shift();
-        playNextSong(guildId);
+            const song = serverQueue.songs[0];
+            serverQueue.lastPlayedUrl = song.url;
+            serverQueue.lastSongErrored = false;
+
+            try {
+                const streamResult = await getAudioStream(song.url);
+                if (!queue.has(guildId)) {
+                    streamResult.stream.destroy();
+                    return;
+                }
+
+                const resource = createAudioResource(streamResult.stream, {
+                    inlineVolume: true
+                });
+                if (resource.volume) {
+                    resource.volume.setVolume(serverQueue.volume);
+                }
+                serverQueue.audioResource = resource;
+                serverQueue.player.play(resource);
+
+                checkAndFetchAutoplay(serverQueue);
+                return;
+            } catch (error) {
+                console.error(`Error playing "${song.title}":`, error);
+                serverQueue.songs.shift();
+            }
+        }
+
+        // Queue is empty and no more songs to play: wait 60 seconds before leaving
+        if (serverQueue.leaveTimeout) clearTimeout(serverQueue.leaveTimeout);
+        serverQueue.leaveTimeout = setTimeout(() => {
+            const currentQueue = queue.get(guildId);
+            if (currentQueue && currentQueue.songs.length === 0) {
+                destroyQueue(guildId);
+            }
+        }, 60_000);
+    } finally {
+        const currentQueue = queue.get(guildId);
+        if (currentQueue) {
+            currentQueue.isStartingTrack = false;
+        }
     }
 }
 
@@ -675,45 +1022,23 @@ async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<Qu
     const nextSongs: QueueItem[] = [];
 
     try {
-        // Use yt-dlp to get video info + related videos in one shot
-        const ytDlpInfoArgs: any = {
-            dumpSingleJson: true,
-            flatPlaylist: true,
-            'no-warnings': true,
-            'js-runtimes': 'node',
-            'extractor-args': 'youtube:player_client=default,android,ios,web'
-        };
-        if (cookiesFilePath) ytDlpInfoArgs.cookies = cookiesFilePath;
-
-        // Get the YouTube Mix (auto-generated playlist) for this video
-        // YouTube creates a "Radio" mix playlist for every video
-        const videoId = lastUrl.match(/[?&]v=([^&]+)/)?.[1];
+        const videoId = extractYouTubeVideoId(lastUrl);
         if (!videoId) throw new Error('Could not extract video ID from URL');
 
         const mixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-        
-        const data: any = await (ytDlp as any)(mixUrl, ytDlpInfoArgs);
+        const data = await fetchYtDlpJson(mixUrl, { flatPlaylist: true });
 
         if (data && data.entries && data.entries.length > 0) {
-            // Skip the first entry (it's the current song itself)
             const entries = data.entries.filter((e: any) => e.id !== videoId).slice(0, count);
             for (const entry of entries) {
-                nextSongs.push({
-                    title: entry.title || 'AutoPlayed Song',
-                    url: entry.url || `https://www.youtube.com/watch?v=${entry.id}`,
-                    requestedBy: 'AutoPlay 🤖',
-                    thumbnail: entry.thumbnails?.[entry.thumbnails.length - 1]?.url,
-                    duration: entry.duration ? `${Math.floor(entry.duration / 60)}:${String(Math.floor(entry.duration % 60)).padStart(2, '0')}` : undefined,
-                    channel: entry.uploader || entry.channel,
-                    isAutoplay: true
-                });
+                const song = mapYtDlpEntryToQueueItem(entry, 'AutoPlay 🤖', true);
+                if (song) nextSongs.push(song);
             }
         }
     } catch (err) {
         console.error('[Autoplay] yt-dlp mix fetch failed, trying search fallback:', err);
     }
 
-    // Fallback: if yt-dlp mix didn't work, use play-dl search
     if (nextSongs.length === 0) {
         try {
             const searchResults = await play.search('music mix', { limit: count });
@@ -739,28 +1064,21 @@ async function getAutoplaySongs(lastUrl: string, count: number = 10): Promise<Qu
 
 async function checkAndFetchAutoplay(serverQueue: ServerQueue) {
     if (!serverQueue.autoplay) return;
-    
-    // Check how many autoplay songs are upcoming (excluding currently playing song at index 0)
+
     const upcomingAutoplayCount = serverQueue.songs.slice(1).filter(s => s.isAutoplay).length;
-    
-    // Only fetch if we have less than 2 autoplay songs upcoming
     if (upcomingAutoplayCount >= 2) return;
-    
-    // Use the last user-added song (non-autoplay) for better recommendations,
-    // falling back to the last song in queue, then the last played URL
+
     const lastUserSong = [...serverQueue.songs].reverse().find(s => !s.isAutoplay);
     const lastSong = serverQueue.songs.length > 0 ? serverQueue.songs[serverQueue.songs.length - 1] : null;
     const searchUrl = lastUserSong?.url || lastSong?.url || serverQueue.lastPlayedUrl;
     if (!searchUrl) return;
-    
-    // Prevent fetching multiple times if it's already fetching
+
     if (serverQueue.isFetchingAutoplay) return;
     serverQueue.isFetchingAutoplay = true;
 
     try {
         const nextSongs = await getAutoplaySongs(searchUrl, 10);
-        
-        // Recheck just in case the state changed while fetching (e.g. user turned off autoplay)
+
         if (serverQueue.autoplay && nextSongs.length > 0) {
             serverQueue.songs.push(...nextSongs);
             console.log(`[Autoplay] Added ${nextSongs.length} songs to queue. Total: ${serverQueue.songs.length}`);
@@ -798,19 +1116,19 @@ function getDashboardRows(serverQueue: ServerQueue) {
 function getQueueEmbed(serverQueue: ServerQueue, page: number = 0) {
     const PAGE_SIZE = 10;
     const maxPage = Math.max(0, Math.ceil(serverQueue.songs.length / PAGE_SIZE) - 1);
-    
+
     if (page < 0) page = 0;
     if (page > maxPage) page = maxPage;
-    
+
     const start = page * PAGE_SIZE;
     const end = start + PAGE_SIZE;
     const currentSongs = serverQueue.songs.slice(start, end);
-    
+
     const queueString = currentSongs.map((song, index) => {
         const actualIndex = start + index;
         return `${actualIndex === 0 ? '**[Playing]**' : `**${actualIndex}.**`} [${song.title.substring(0, 50)}](${song.url}) - \`@${song.requestedBy}\``;
     }).join('\n');
-    
+
     return new EmbedBuilder()
         .setColor('#2b2d31')
         .setTitle(`📜 Queue (Page ${page + 1}/${maxPage + 1})`)
@@ -821,7 +1139,7 @@ function getQueueEmbed(serverQueue: ServerQueue, page: number = 0) {
 function getQueuePaginationRow(page: number, totalSongs: number) {
     const PAGE_SIZE = 10;
     const maxPage = Math.max(0, Math.ceil(totalSongs / PAGE_SIZE) - 1);
-    
+
     return new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
             .setCustomId(`music_qprev_${page}`)
@@ -854,14 +1172,10 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
                 await interaction.reply({ content: "▶️ Resumed the music.", ephemeral: false });
             }
         } else if (interaction.customId === 'music_skip') {
-            serverQueue.player.stop(); // triggers Idle and plays next
+            serverQueue.player.stop();
             await interaction.reply({ content: "⏭️ Skipped to the next song.", ephemeral: false });
         } else if (interaction.customId === 'music_stop') {
-            serverQueue.songs = [];
-            if (serverQueue.leaveTimeout) clearTimeout(serverQueue.leaveTimeout);
-            serverQueue.player.stop();
-            serverQueue.connection.destroy();
-            queue.delete(interaction.guildId!);
+            destroyQueue(interaction.guildId!);
             await interaction.reply({ content: "🛑 Stopped playing and left the channel.", ephemeral: false });
         } else if (interaction.customId === 'music_queue') {
             if (serverQueue.songs.length === 0) {
@@ -872,16 +1186,16 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
         } else if (interaction.customId.startsWith('music_qprev_') || interaction.customId.startsWith('music_qnext_')) {
             const isNext = interaction.customId.startsWith('music_qnext_');
-            const currentPage = parseInt(interaction.customId.split('_').pop() || '0');
+            const currentPage = parseInt(interaction.customId.split('_').pop() || '0', 10);
             const targetPage = isNext ? currentPage + 1 : currentPage - 1;
-            
+
             if (serverQueue.songs.length === 0) {
                 return interaction.update({ content: "The queue is currently empty!", embeds: [], components: [] });
             }
-            
+
             const embed = getQueueEmbed(serverQueue, targetPage);
             const row = getQueuePaginationRow(targetPage, serverQueue.songs.length);
-            
+
             await interaction.update({ embeds: [embed], components: [row] });
         } else if (interaction.customId === 'music_loop') {
             serverQueue.loop = !serverQueue.loop;
@@ -891,8 +1205,7 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             serverQueue.autoplay = !serverQueue.autoplay;
             const rows = getDashboardRows(serverQueue);
             await interaction.update({ components: rows });
-            
-            // If turned on, pre-fetch immediately
+
             if (serverQueue.autoplay) {
                 checkAndFetchAutoplay(serverQueue);
             }
@@ -927,7 +1240,6 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             if (serverQueue.songs.length <= 2) {
                 return interaction.reply({ content: "Not enough songs in the queue to shuffle!", ephemeral: true });
             }
-            // Shuffle from index 1 to the end (keep index 0 playing)
             const queueToShuffle = serverQueue.songs.slice(1);
             for (let i = queueToShuffle.length - 1; i > 0; i--) {
                 const j = Math.floor(Math.random() * (i + 1));
@@ -936,7 +1248,6 @@ export async function handleMusicInteraction(interaction: ButtonInteraction) {
             serverQueue.songs = [serverQueue.songs[0], ...queueToShuffle];
             await interaction.reply({ content: "🔀 Queue has been shuffled!", ephemeral: false });
         } else {
-            // Placeholder for the buttons that are not implemented yet
             await interaction.reply({ content: "✨ Fitur ini masih dalam tahap pengembangan (Segera hadir)!", ephemeral: true });
         }
     } catch (error) {

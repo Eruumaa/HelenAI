@@ -9,7 +9,7 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Lazy initialize Gemini API client to prevent crashing if the key is missing on startup
 let aiClient: GoogleGenAI | null = null;
@@ -58,7 +58,7 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: formattedContents,
       config,
     });
@@ -105,7 +105,7 @@ Respond with a JSON block. Use the exact keys:
 Message to analyze: "${text.replace(/"/g, '\\"')}"`;
 
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
@@ -146,7 +146,7 @@ Their custom bio or interests are: "${bio || "No bio provided"}".
 Keep it friendly, highly personalized to their bio if they have one, use Discord markdown formatting (like **bold**, *italics*, or \`code\`), and make it sound natural and human, not boilerplate. Do not include the bot's name, just write the welcome message itself.`;
 
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
     });
 
@@ -155,6 +155,11 @@ Keep it friendly, highly personalized to their bio if they have one, use Discord
     console.error("Error in /api/welcome:", error);
     res.status(500).json({ error: error.message || "An error occurred during welcome message generation." });
   }
+});
+
+// Health check endpoint for Render
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
 });
 
 // Vite middleware integration or production static serving
