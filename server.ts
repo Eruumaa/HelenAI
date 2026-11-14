@@ -174,7 +174,7 @@ async function initializeServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
     console.log("Serving production static assets.");
-  } else if (process.env.NODE_ENV !== "production") {
+  } else if (process.env.NODE_ENV !== "production" && process.env.SKIP_VITE !== "true") {
     try {
       const { createServer: createViteServer } = await import("vite");
       const vite = await createViteServer({

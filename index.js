@@ -56,5 +56,6 @@ if (process.env.NODE_ENV === "production" && fs.existsSync(builtServer)) {
     execFileSync(process.execPath, ["-e", transpileScript], { cwd: rootDir, stdio: "inherit" });
   }
 
+  process.env.SKIP_VITE = "true";
   require(path.join(runtimeDir, "server.js"));
 }

@@ -898,7 +898,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
         url
     ];
 
-    if (isNightly) {
+    if (isNightly && useCookies) {
         args.splice(6, 0, '--js-runtimes', 'node');
     }
     if (useCookies && cookiesFilePath) {
@@ -941,7 +941,7 @@ async function runYtDlpStream(url: string, useCookies: boolean): Promise<Readabl
                 if (!output.destroyed) output.destroy();
                 reject(new Error(`yt-dlp timed out waiting for audio data. Stderr: ${errorData.substring(0, 300)}`));
             }
-        }, 25_000);
+        }, 35_000);
 
         ytDlpProcess.stdout.on('error', () => {});
         ytDlpProcess.stdout.pipe(output);
