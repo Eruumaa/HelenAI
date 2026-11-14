@@ -94,9 +94,14 @@ export async function startBot() {
     }
   });
 
+  client.on(Events.Error, (err) => {
+    console.error("[Discord Client Error]", err);
+  });
+
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const command = interaction.commandName;
+      console.log(`[Interaction] /${command} by ${interaction.user.tag} in guild ${interaction.guildId}`);
       
       if (command === 'help') {
         const embed = new EmbedBuilder()

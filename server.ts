@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
@@ -9,7 +10,7 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
 
 // Lazy initialize Gemini API client to prevent crashing if the key is missing on startup
 let aiClient: GoogleGenAI | null = null;
@@ -164,25 +165,34 @@ app.get("/health", (_req, res) => {
 
 // Vite middleware integration or production static serving
 async function initializeServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-    console.log("Vite dev server middleware loaded.");
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
+  const distPath = path.join(process.cwd(), "dist");
+  const hasBuiltUi = fs.existsSync(path.join(distPath, "index.html"));
+
+  if (hasBuiltUi) {
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
     console.log("Serving production static assets.");
+  } else if (process.env.NODE_ENV !== "production") {
+    try {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+      console.log("Vite dev server middleware loaded.");
+    } catch (err: any) {
+      console.warn("Vite dev middleware unavailable (running API + Discord bot only):", err?.message || err);
+    }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Express server running on http://localhost:${PORT}`);
+  });
+  httpServer.on("error", (err: any) => {
+    console.warn(`HTTP server warning on port ${PORT} (Discord bot still running):`, err?.message || err);
   });
 
   // Start the Discord bot

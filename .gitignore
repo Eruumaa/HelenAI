@@ -13,3 +13,4 @@ youtube-cookies-env.txt
 test-cookies.txt
 yt-dlp-nightly-binary*
 .bin/
+.runtime/

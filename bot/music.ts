@@ -28,11 +28,16 @@ import {
 } from 'discord.js';
 
 const IS_WINDOWS = process.platform === 'win32';
+const YT_DLP_BINARY_NAME = IS_WINDOWS
+    ? 'yt-dlp.exe'
+    : process.platform === 'darwin'
+    ? 'yt-dlp_macos'
+    : process.arch === 'arm64'
+    ? 'yt-dlp_linux_aarch64'
+    : 'yt-dlp_linux';
 const YT_DLP_DIR = path.join(process.cwd(), '.bin');
 const YT_DLP_BINARY_PATH = path.join(YT_DLP_DIR, IS_WINDOWS ? 'yt-dlp.exe' : 'yt-dlp');
-const YT_DLP_DOWNLOAD_URL = IS_WINDOWS
-    ? 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe'
-    : 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
+const YT_DLP_DOWNLOAD_URL = `https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/${YT_DLP_BINARY_NAME}`;
 const YT_DLP_BUNDLED_PATH = path.join(
     process.cwd(),
     'node_modules',
@@ -144,8 +149,61 @@ function ensureYtDlp(): Promise<YtDlpState> {
     return ytDlpStatePromise;
 }
 
-// Kick off binary check/download at startup without blocking HTTP server boot
+// Kick off binary checks/downloads at startup without blocking HTTP server boot
 ensureYtDlp().catch((err) => console.error('[Setup] yt-dlp init error:', err));
+
+let ffmpegInitPromise: Promise<void> | null = null;
+function ensureFfmpeg(): Promise<void> {
+    if (ffmpegInitPromise) return ffmpegInitPromise;
+
+    ffmpegInitPromise = (async () => {
+        try {
+            const prismMod: any = await import('prism-media');
+            const FFmpeg = prismMod.default?.FFmpeg ?? prismMod.FFmpeg;
+            FFmpeg.getInfo(true);
+            console.log('[Setup] ✅ FFmpeg found and ready.');
+            return;
+        } catch {
+            console.log('[Setup] FFmpeg missing (install script may have been skipped); downloading via ffmpeg-static...');
+        }
+
+        const installerPath = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'install.js');
+        if (!fs.existsSync(installerPath)) {
+            console.warn('[Setup] ⚠️ ffmpeg-static installer not found; audio playback requires system ffmpeg.');
+            return;
+        }
+
+        await new Promise<void>((resolve) => {
+            const proc = spawn(process.execPath, [installerPath], {
+                cwd: path.dirname(installerPath),
+                stdio: 'inherit'
+            });
+            proc.on('close', async (code) => {
+                if (code === 0) {
+                    try {
+                        const prismMod: any = await import('prism-media');
+                        const FFmpeg = prismMod.default?.FFmpeg ?? prismMod.FFmpeg;
+                        FFmpeg.getInfo(true);
+                        console.log('[Setup] ✅ FFmpeg installed and ready.');
+                    } catch (err: any) {
+                        console.warn('[Setup] ⚠️ FFmpeg downloaded, check warning:', err?.message);
+                    }
+                } else {
+                    console.error(`[Setup] ❌ ffmpeg-static installer exited with code ${code}`);
+                }
+                resolve();
+            });
+            proc.on('error', (err) => {
+                console.error('[Setup] ❌ Failed to run ffmpeg-static installer:', err);
+                resolve();
+            });
+        });
+    })();
+
+    return ffmpegInitPromise;
+}
+
+ensureFfmpeg().catch((err) => console.error('[Setup] ffmpeg init error:', err));
 
 function applyParsedCookies(cookieStr: string, cookiesArray: any[]) {
     if (cookieStr.trim()) {
@@ -370,10 +428,26 @@ function mapYtDlpEntryToQueueItem(entry: any, requestedBy: string, isAutoplay = 
     };
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        promise.then(
+            (val) => {
+                clearTimeout(timer);
+                resolve(val);
+            },
+            (err) => {
+                clearTimeout(timer);
+                reject(err);
+            }
+        );
+    });
+}
+
 async function searchYouTubeTrack(searchStr: string, requestedBy: string): Promise<QueueItem | null> {
-    // 1. Try play-dl search
+    // 1. Try play-dl search with short timeout
     try {
-        const searchResults = await play.search(searchStr, { limit: 1 });
+        const searchResults = await withTimeout(play.search(searchStr, { limit: 1 }), 8_000, 'play.search');
         if (searchResults && searchResults.length > 0) {
             const first = searchResults[0];
             return {
@@ -603,7 +677,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                 // Single URL: try play-dl first, then fall back to yt-dlp metadata
                 let loaded = false;
                 try {
-                    const data = await play.video_info(query);
+                    const data = await withTimeout(play.video_info(query), 8_000, 'play.video_info');
                     songsToAdd.push({
                         title: data.video_details.title || 'Unknown Title',
                         url: data.video_details.url,
@@ -668,6 +742,10 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
             queueConstruct.songs.push(...songsToAdd);
 
             try {
+                connection.on('stateChange', (oldState, newState) => {
+                    console.log(`[Voice] ${oldState.status} -> ${newState.status}`);
+                });
+
                 connection.on('error', (err) => {
                     console.error('[VoiceConnection Error]', err);
                 });
@@ -683,6 +761,7 @@ async function executePlay(interaction: ChatInputCommandInteraction, serverQueue
                     }
                 });
 
+                await interaction.editReply(`⏳ Found **${firstSong.title}** — connecting to voice and buffering audio...`);
                 connection.subscribe(queueConstruct.player);
                 await playNextSong(interaction.guild!.id);
 
@@ -928,7 +1007,7 @@ async function getAudioStream(url: string): Promise<{ stream: Readable }> {
     // Backend 3: play-dl
     try {
         console.log('[Stream] Trying play-dl...');
-        const playStream = await play.stream(url);
+        const playStream = await withTimeout(play.stream(url), 10_000, 'play.stream');
         const stream = await waitForReadableStream(playStream.stream as unknown as Readable);
         console.log('[Stream] ✅ play-dl stream started successfully');
         return { stream };
@@ -978,6 +1057,7 @@ async function playNextSong(guildId: string) {
             serverQueue.lastSongErrored = false;
 
             try {
+                await ensureFfmpeg();
                 const streamResult = await getAudioStream(song.url);
                 if (!queue.has(guildId)) {
                     streamResult.stream.destroy();
